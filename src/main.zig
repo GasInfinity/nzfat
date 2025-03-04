@@ -9,6 +9,8 @@ const FileBlockContext = struct {
     allocator: std.mem.Allocator,
     fd: std.fs.File,
     logical_block_size: usize,
+    maps: usize = 0,
+    commits: usize = 0,
 
     pub const Sector = usize;
     pub const SectorResult = struct {
@@ -23,12 +25,14 @@ const FileBlockContext = struct {
         var read_res = SectorResult{ .data = try ctx.allocator.alloc(u8, ctx.logical_block_size) };
         try ctx.fd.seekTo(sector * ctx.logical_block_size);
         std.debug.assert(try ctx.fd.read(read_res.data[0..ctx.logical_block_size]) == ctx.logical_block_size);
+        ctx.maps += 1;
         return read_res;
     }
 
     pub fn commit(ctx: *FileBlockContext, sector: Sector, result: SectorResult) !void {
         try ctx.fd.seekTo(sector * ctx.logical_block_size);
         _ = try ctx.fd.write(result.data);
+        ctx.commits += 1;
     }
 
     pub fn unmap(ctx: *FileBlockContext, _: Sector, result: SectorResult) void {
@@ -97,6 +101,7 @@ pub fn main() !void {
 
     var buf: [256]u8 = undefined;
     while (true) {
+        try stdout.print("{} maps, {} commits\n", .{ floppy_blk_ctx.maps, floppy_blk_ctx.commits });
         try stdout.print("{s} => ", .{current_path.items});
 
         const input = try stdin.readUntilDelimiter(&buf, '\n');
@@ -194,18 +199,20 @@ pub fn main() !void {
                                 break :reading;
                             }
                         }
+
+                        try stdout.print("File size: {} bytes\n", .{ent.file_size});
                     } else {
                         try stdout.print("File not found.\n", .{});
                     }
                 },
                 .mkdir => {
                     if (try fat_ctx.searchShortEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], "testing.txt") == null) {
-                        try fat_ctx.createShortEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], "testing.txt", .{ .directory = 10 });
+                        try fat_ctx.createShortEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], "testing.txt", .{ .type = .{ .file = 0 } });
                     } else {
                         try stdout.print("File already exists!\n", .{});
                     }
 
-                    try stdout.print("TODO\n", .{});
+                    try stdout.print("TODO Handle paths\n", .{});
                     // TODO
                 },
                 .rm => {

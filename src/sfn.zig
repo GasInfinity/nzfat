@@ -32,7 +32,7 @@ pub fn codepageToShortFilename(value: []const u8) [len]u8 {
 
     if (base_copying_characters > 0) {
         const first_c = trimmed[0];
-        sfn[0] = if (isAllowedCharacter(first_c)) (if (first_c == 0xE5) 0x05 else first_c) else '_';
+        sfn[0] = if (isAllowedCharacter(first_c)) (if (first_c == 0xE5) 0x05 else std.ascii.toUpper(first_c)) else '_';
 
         for (1..base_copying_characters) |i| {
             const c = std.ascii.toUpper(trimmed[i]);

@@ -15,7 +15,7 @@ const LongFileNameEntry = structs.LongFileNameEntry;
 
 // TODO: Maybe reorganize this
 
-pub const Type = enum(u2) { fat12, fat16, fat32 };
+pub const FatType = enum(u2) { fat12, fat16, fat32 };
 
 pub const MountError = error{
     /// Invalid jump code, it must be 0xEB or 0xE9
@@ -74,7 +74,7 @@ pub const Config = struct {
     };
 
     /// The maximum supported FAT of the FatFilesystem, affects code size.
-    maximum_supported_type: Type = .fat32,
+    maximum_supported_type: FatType = .fat32,
 
     /// Whether the FatFilesystem supports the VFAT extension for long filenames, affects code size greatly.
     long_filenames: ?LongFilenameConfig = LongFilenameConfig{},
@@ -93,11 +93,44 @@ pub const EntryCreationType = union(EntryType) {
     directory: usize,
 };
 
+pub const EntryCreationInfo = struct {
+    type: EntryCreationType,
+    read_only: bool = false,
+    hidden: bool = false,
+    system: bool = false,
+    creation_time_tenth: u8 = 0,
+    creation_time: Time = std.mem.zeroes(Time),
+    creation_date: Date = std.mem.zeroes(Date),
+
+    pub inline fn asDirectoryEntry(info: EntryCreationInfo, name: [sfn.len]u8, cluster: anytype, file_size: u32) DirectoryEntry {
+        return DirectoryEntry{
+            .name = name,
+            .attributes = .{
+                .directory = info.type == .directory,
+                .read_only = info.read_only,
+                .hidden = info.hidden,
+                .system = info.system,
+                .volume_id = false,
+                .archive = false,
+            },
+            .creation_time_tenth = info.creation_time_tenth,
+            .creation_time = info.creation_time,
+            .creation_date = info.creation_date,
+            .last_access_date = info.creation_date,
+            .first_cluster_hi = @intCast(cluster >> 16),
+            .write_time = info.creation_time,
+            .write_date = info.creation_date,
+            .first_cluster_lo = @intCast(cluster & 0xFFFF),
+            .file_size = file_size,
+        };
+    }
+};
+
 pub const ClusterError = error{ InvalidClusterValue, OutOfClusters };
 pub const EntryCreationError = error{OutOfRootDirectoryEntries};
 pub const EntryDeletionError = error{NonEmptyDirectory};
 
-const MiscData = packed struct(u16) { type: Type, mul: u1, div: u1, bytes_per_sector: u4, sectors_per_cluster: u3, directory_entries_per_sector: u3, _: u2 = 0 };
+const MiscData = packed struct(u16) { type: FatType, mul: u1, div: u1, bytes_per_sector: u4, sectors_per_cluster: u3, directory_entries_per_sector: u3, _: u2 = 0 };
 const allowed_media_values = [_]u8{ 0xF0, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF };
 
 /// Implements a FAT Filesystem as specified in official documentation with support for its VFAT extension.
@@ -138,7 +171,50 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         };
 
         pub const TableEntryType = enum { free, allocated, defective, reserved, end_of_file };
-        pub const TableEntry = union(TableEntryType) { free, allocated: Cluster, defective, reserved, end_of_file };
+        pub const TableEntry = union(TableEntryType) {
+            free,
+            allocated: Cluster,
+            defective,
+            reserved,
+            end_of_file,
+
+            pub inline fn fromClusterIndex(cluster_index: Cluster, max_cluster: Cluster, fat_type: FatType) TableEntry {
+                return switch (cluster_index) {
+                    0x0 => .free,
+                    else => |c| if (c <= max_cluster) .{ .allocated = c } else switch (fat_type) {
+                        .fat12 => switch (c) {
+                            0xFF7 => .defective,
+                            0xFF8...0xFFF => .end_of_file,
+                            else => .reserved,
+                        },
+                        .fat16 => switch (c) {
+                            0xFFF7 => .defective,
+                            0xFFF8...0xFFFF => .end_of_file,
+                            else => .reserved,
+                        },
+                        .fat32 => switch (c) {
+                            0xFFFFFF7 => .defective,
+                            0xFFFFFF8...0xFFFFFFF => .end_of_file,
+                            else => .reserved,
+                        },
+                    },
+                };
+            }
+
+            pub inline fn asClusterIndex(entry: TableEntry, fat_type: FatType) Cluster {
+                return switch (entry) {
+                    .free => 0x00,
+                    .end_of_file => std.math.maxInt(Cluster),
+                    .allocated => |v| v,
+                    .defective => switch (fat_type) {
+                        .fat12 => 0xFF7,
+                        .fat16 => 0xFFF7,
+                        .fat32 => 0xFFFFFF7,
+                    },
+                    .reserved => unreachable,
+                };
+            }
+        };
 
         misc: MiscData,
         root_entry_data: RootDirectoryEntryData,
@@ -227,7 +303,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             const cluster_count: Cluster = @intCast(data_sectors >> sectors_per_cluster_shift);
             const max_cluster: Cluster = cluster_count + 1;
 
-            const fat_type: Type = if (cluster_count < 4085) .fat12 else if (cluster_count < 65525) .fat16 else .fat32;
+            const fat_type: FatType = if (cluster_count < 4085) .fat12 else if (cluster_count < 65525) .fat16 else .fat32;
 
             return switch (config.maximum_supported_type) {
                 .fat12 => if (fat_type != .fat12) MountError.UnsupportedFat else Self{
@@ -319,7 +395,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             _ = blk;
         }
 
-        pub inline fn getType(fat_ctx: Self) Type {
+        pub inline fn getType(fat_ctx: Self) FatType {
             return if (config.maximum_supported_type == .fat12) .fat12 else fat_ctx.misc.type;
         }
 
@@ -327,33 +403,61 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             return if (fat_ctx.getType() == .fat32) fat_ctx.root_entry_data.cluster else 0;
         }
 
-        pub const SearchResult = struct {
-            record: DirectoryIterator.RecordedEntry,
-            attributes: Attributes,
-            cluster: Cluster,
-            file_size: u32,
+        const DirEntrySectorLocation = struct {
+            // NOTE: A long filename could span a maximum of three sectors if configured to the standard.
+            pub const is_single_entry = max_file_entries == 1;
+            pub const max_entry_sectors = ((max_file_entries + 14) / 16) + 1;
+
+            pub const StackIndex = if (max_entry_sectors > 1) u8 else void;
+            pub const EndIndex = if (max_file_entries > 1) u8 else void;
+
+            sector_stack: [max_entry_sectors]BlockSector,
+            sector_stack_current: StackIndex,
+            sector_entry_start: u8,
+            // NOTE: Inclusive index
+            sector_entry_end: EndIndex,
+
+            pub inline fn getSectorStack(r: DirEntrySectorLocation) []const BlockSector {
+                return r.sector_stack[0..(if (max_entry_sectors > 1) r.sector_stack_current else 1)];
+            }
+
+            pub inline fn isSingleEntry(r: DirEntrySectorLocation) bool {
+                return if (is_single_entry) true else r.sector_entry_start == r.sector_entry_end;
+            }
         };
 
-        pub fn searchEntry(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: EntryName) !?SearchResult {
+        pub const DirEntry = struct {
+            location: DirEntrySectorLocation,
+            attributes: Attributes,
+            creation_time_tenth: u8,
+            creation_time: Time,
+            creation_date: Date,
+            last_access_date: Date,
+            write_time: Time,
+            write_date: Date,
+            cluster: Cluster,
+            file_size: u32,
+
+            pub inline fn isShortnameOnly(entry: DirEntry) bool {
+                return entry.location.isSingleEntry();
+            }
+        };
+
+        pub fn searchEntry(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: EntryName) !?DirEntry {
             if (@sizeOf(LongContext) != 0)
                 @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call searchEntryContext instead.");
             return fat_ctx.searchEntryContext(blk, cluster, name, undefined);
         }
 
-        pub fn searchEntryContext(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: EntryName, ctx: LongContext) !?SearchResult {
+        pub fn searchEntryContext(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: EntryName, ctx: LongContext) !?DirEntry {
             if (config.long_filenames) |_| {
                 var it = fat_ctx.directoryIterator(cluster);
                 defer it.deinit(blk);
 
-                while (try it.next(blk)) |dirent| {
-                    if (dirent.lfn) |lfn| {
+                while (try it.next(blk)) |it_entry| {
+                    if (it_entry.lfn) |lfn| {
                         if (ctx.eql(lfn, name)) {
-                            return SearchResult{
-                                .record = dirent.record,
-                                .attributes = dirent.attributes,
-                                .cluster = dirent.cluster,
-                                .file_size = dirent.file_size,
-                            };
+                            return it_entry.entry;
                         }
                     } else {
                         if (name.len > sfn.len + 1) {
@@ -361,15 +465,10 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         }
 
                         var sfn_buf: [sfn.len + 1]u16 = undefined;
-                        ctx.codepageToUcs2Le(&sfn_buf, dirent.sfn);
+                        ctx.codepageToUcs2Le(&sfn_buf, it_entry.sfn);
 
                         if (ctx.eql(sfn_buf[0..name.len], name)) {
-                            return SearchResult{
-                                .record = dirent.record,
-                                .attributes = dirent.attributes,
-                                .cluster = dirent.cluster,
-                                .file_size = dirent.file_size,
-                            };
+                            return it_entry.entry;
                         }
                     }
                 }
@@ -377,18 +476,14 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 return null;
             } else return searchShortEntry(fat_ctx, blk, cluster);
         }
-        pub fn searchShortEntry(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: []const u8) !?SearchResult {
+
+        pub fn searchShortEntry(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: []const u8) !?DirEntry {
             var it = fat_ctx.directoryIterator(cluster);
             defer it.deinit(blk);
 
-            while (try it.next(blk)) |dirent| {
-                if (std.ascii.eqlIgnoreCase(dirent.sfn, name)) {
-                    return SearchResult{
-                        .record = dirent.record,
-                        .attributes = dirent.attributes,
-                        .cluster = dirent.cluster,
-                        .file_size = dirent.file_size,
-                    };
+            while (try it.next(blk)) |it_entry| {
+                if (std.ascii.eqlIgnoreCase(it_entry.sfn, name)) {
+                    return it_entry.entry;
                 }
             }
 
@@ -400,48 +495,25 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         }
 
         const DirectoryIterator = struct {
-            const SelfIterator = @This();
-
             const LongEntryName = if (config.long_filenames) |_| ?[:0]const u16 else void;
             const LongEntryNameBuffer = if (config.long_filenames) |_| [config.long_filenames.?.maximum_supported_len:0]u16 else void;
 
-            // NOTE: A long filename could span a maximum of three sectors if configured to the standard.
-            const max_recorded_sectors = ((max_file_entries + 14) / 16) + 1;
-            const StackIndex = if (max_recorded_sectors > 1) u8 else void;
-            const RecordEndIndex = if (max_file_entries > 1) u8 else void;
-
-            const RecordedEntry = struct {
-                pub const is_single_entry = max_file_entries == 1;
-
-                sector_stack: [max_recorded_sectors]BlockSector,
-                sector_stack_current: StackIndex,
-                sector_entry_start: u8,
-                sector_entry_end: RecordEndIndex,
-
-                pub inline fn getSectorStack(r: RecordedEntry) []const BlockSector {
-                    return r.sector_stack[0..(if (max_recorded_sectors > 1) r.sector_stack_current else 1)];
-                }
-            };
-
-            pub const Entry = struct {
-                record: RecordedEntry,
+            pub const IteratorEntry = struct {
                 sfn: []const u8,
                 lfn: LongEntryName,
-                attributes: Attributes,
-                cluster: Cluster,
-                file_size: u32,
+                entry: DirEntry,
             };
 
             it: DirectoryEntriesIterator,
-            record: RecordedEntry = undefined,
+            current_location: DirEntrySectorLocation = undefined,
             sfn: [sfn.len + 1:0]u8 = undefined,
             lfn: LongEntryNameBuffer = undefined,
 
-            pub fn initContext(it: DirectoryEntriesIterator) SelfIterator {
-                return SelfIterator{ .it = it };
+            pub fn initContext(it: DirectoryEntriesIterator) DirectoryIterator {
+                return DirectoryIterator{ .it = it };
             }
 
-            inline fn unpackDirectoryEntry(it: *SelfIterator, entry: DirectoryEntry, lfn: LongEntryName) Entry {
+            inline fn unpackDirectoryEntry(it: *DirectoryIterator, entry: DirectoryEntry, lfn: LongEntryName) IteratorEntry {
                 const written: usize = sfn.shortFilenameToT(u8, &it.sfn, entry.name);
 
                 if (written < it.sfn.len) {
@@ -451,21 +523,29 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 const cluster = unpackCluster(entry);
 
                 if (max_file_entries > 1) {
-                    it.record.sector_entry_end = it.it.lastSectorEntry();
+                    it.current_location.sector_entry_end = it.it.lastSectorEntry();
                 }
 
-                return Entry{
-                    .record = it.record,
+                return IteratorEntry{
                     .sfn = it.sfn[0..written :0],
                     .lfn = lfn,
-                    .attributes = entry.attributes,
-                    .cluster = cluster,
-                    .file_size = entry.file_size,
+                    .entry = DirEntry{
+                        .location = it.current_location,
+                        .attributes = entry.attributes,
+                        .creation_time_tenth = entry.creation_time_tenth,
+                        .creation_time = entry.creation_time,
+                        .creation_date = entry.creation_date,
+                        .last_access_date = entry.last_access_date,
+                        .write_time = entry.write_time,
+                        .write_date = entry.write_date,
+                        .cluster = cluster,
+                        .file_size = entry.file_size,
+                    },
                 };
             }
 
             // TODO: What to do with invalid entries, skip them or return error?
-            pub fn next(it: *SelfIterator, blk: *BlockDevice) !?Entry {
+            pub fn next(it: *DirectoryIterator, blk: *BlockDevice) !?IteratorEntry {
                 next_entry: while (try it.it.next(blk)) |next_dirent| {
                     var current_entry: DirectoryEntry = next_dirent;
 
@@ -479,11 +559,11 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
                     // We don't have goto's, we have to have this loop :)
                     retry_entry: while (true) {
-                        it.record.sector_entry_start = it.it.lastSectorEntry();
-                        it.record.sector_stack[0] = it.it.lastSector();
+                        it.current_location.sector_entry_start = it.it.lastSectorEntry();
+                        it.current_location.sector_stack[0] = it.it.lastSector();
 
-                        if (max_recorded_sectors > 1) {
-                            it.record.sector_stack_current = 1;
+                        if (DirEntrySectorLocation.max_entry_sectors > 1) {
+                            it.current_location.sector_stack_current = 1;
                         }
 
                         if (config.long_filenames != null and current_entry.attributes.isLongName()) {
@@ -531,12 +611,12 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
                                     const last_iterated_sector = it.it.lastSector();
 
-                                    const record_stack_current = it.record.sector_stack_current;
-                                    if (last_iterated_sector != it.record.sector_stack[record_stack_current - 1]) {
-                                        it.record.sector_stack[record_stack_current] = last_iterated_sector;
+                                    const record_stack_current = it.current_location.sector_stack_current;
+                                    if (last_iterated_sector != it.current_location.sector_stack[record_stack_current - 1]) {
+                                        it.current_location.sector_stack[record_stack_current] = last_iterated_sector;
 
-                                        if (max_recorded_sectors > 1) {
-                                            it.record.sector_stack_current += 1;
+                                        if (DirEntrySectorLocation.max_entry_sectors > 1) {
+                                            it.current_location.sector_stack_current += 1;
                                         }
                                     }
 
@@ -583,12 +663,12 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 return null;
             }
 
-            pub fn deinit(it: *SelfIterator, blk: *BlockDevice) void {
+            pub fn deinit(it: *DirectoryIterator, blk: *BlockDevice) void {
                 it.it.deinit(blk);
             }
         };
 
-        pub fn deleteEntry(fat_ctx: *Self, blk: *BlockDevice, entry: SearchResult) !void {
+        pub fn deleteEntry(fat_ctx: *Self, blk: *BlockDevice, entry: DirEntry) !void {
             if (entry.cluster != 0x00) {
                 try fat_ctx.deleteClusterChain(blk, entry.cluster);
             }
@@ -597,40 +677,44 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         }
 
         pub inline fn isDirectoryEmpty(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster) !bool {
-            var it = fat_ctx.directoryIterator(cluster);
+            var it = fat_ctx.directoryEntryIterator(cluster);
             defer it.deinit(blk);
 
-            const first_entry = try it.next(blk);
-            if (first_entry) |dir| {
-                if (!std.mem.eql(u8, dir.sfn, ".          ")) {
+            // NOTE: Should we fail only when reading?
+            try expectDirectoryEntry(&it, blk, ".          ");
+            try expectDirectoryEntry(&it, blk, "..         ");
+
+            while (try it.next(blk)) |dir| {
+                if (!dir.isFree()) {
                     return false;
                 }
-            } else { // TODO: Error? The entry must be present
-                return false;
             }
 
-            const second_entry = try it.next(blk);
-            if (second_entry) |dir| {
-                if (!std.mem.eql(u8, dir.sfn, "..         ")) {
-                    return false;
+            return true;
+        }
+
+        inline fn expectDirectoryEntry(it: *DirectoryEntriesIterator, blk: *BlockDevice, comptime name: *const [sfn.len]u8) !void {
+            if (try it.next(blk)) |dir| {
+                if (!std.mem.eql(u8, &dir.name, name)) {
+                    return; // TODO: Error
                 }
-            } else { // TODO: Error? The entry must be present
-                return false;
+
+                return;
             }
 
-            return try it.next(blk) == null;
+            return; // TODO: Error
         }
 
         inline fn deleteClusterChain(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) !void {
             var current = start;
 
-            while (try fat_ctx.nextAllocatedCluster(blk, current, .{ .write = 0x00 })) |next| {
+            while (try fat_ctx.nextAllocatedCluster(blk, current, .{ .write = .free })) |next| {
                 current = next;
             }
         }
 
-        inline fn deleteDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, entry: SearchResult) !void {
-            const sector_stack = entry.record.getSectorStack();
+        inline fn deleteDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, entry: DirEntry) !void {
+            const sector_stack = entry.location.getSectorStack();
 
             if (sector_stack.len == 1) {
                 const sector_index = sector_stack[0];
@@ -638,15 +722,15 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 defer blk.unmap(sector_index, sector);
 
                 const directories: []DirectoryEntry = @alignCast(std.mem.bytesAsSlice(DirectoryEntry, sector.asSlice()));
-                const start = entry.record.sector_entry_start;
+                const start = entry.location.sector_entry_start;
 
-                if (DirectoryIterator.RecordedEntry.is_single_entry) {
-                    directories[start].name[0] = 0xE5;
+                if (DirEntrySectorLocation.is_single_entry) {
+                    directories[start].name[0] = DirectoryEntry.deletion_flag;
                 } else {
-                    const end = entry.record.sector_entry_end + 1; // The end in the record is inclusive
+                    const end = entry.location.sector_entry_end + 1;
 
                     for (start..end) |i| {
-                        directories[i].name[0] = 0xE5;
+                        directories[i].name[0] = DirectoryEntry.deletion_flag;
                     }
                 }
 
@@ -658,7 +742,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
             {
                 const current_sector_index = sector_stack[0];
-                try deleteSectorDirectoryEntries(blk, current_sector_index, entry.record.sector_entry_start, directory_entries_per_sector);
+                try deleteSectorDirectoryEntries(blk, current_sector_index, entry.location.sector_entry_start, directory_entries_per_sector);
             }
 
             const full_sector_stack_end = sector_stack.len - 1;
@@ -671,7 +755,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
             {
                 const current_sector_index = sector_stack[current_stack_index];
-                const end = entry.record.sector_entry_end + 1; // The end in the record is inclusive
+                const end = entry.location.sector_entry_end + 1;
 
                 try deleteSectorDirectoryEntries(blk, current_sector_index, 0, end);
             }
@@ -690,48 +774,14 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             try blk.commit(sector_index, sector);
         }
 
-        pub fn createShortEntry(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: []const u8, entry: EntryCreationType) !void {
-            var dir_it = fat_ctx.directoryEntryIterator(cluster);
-            defer dir_it.deinit(blk);
-
-            _ = entry;
-            const FreeSingleEntryData = struct { free_sector: BlockSector, free_entry: u8 };
-            const maybe_free: ?FreeSingleEntryData = while (try dir_it.next(blk)) |dirent| {
-                if (dirent.isFree()) {
-                    break FreeSingleEntryData{ .free_sector = dir_it.lastSector(), .free_entry = dir_it.lastSectorEntry() };
-                }
-            } else null;
-
-            if (maybe_free) |free| {
-                const sector = try blk.map(free.free_sector);
-                defer blk.unmap(free.free_sector, sector);
-
-                const directory_entries: []DirectoryEntry = std.mem.bytesAsSlice(DirectoryEntry, sector.asSlice());
-
-                directory_entries[free.free_entry] = std.mem.zeroes(DirectoryEntry);
-                directory_entries[free.free_entry].name = sfn.codepageToShortFilename(name);
-                directory_entries[free.free_entry].file_size = 0;
-
-                try blk.commit(free.free_sector, sector);
-                return;
-            }
-
-            if (dir_it.current_cluster == 0) {
-                return EntryCreationError.OutOfRootDirectoryEntries;
-            }
-
-            // TODO: Find next empty and grow cluster chain
-            unreachable;
-        }
-
-        pub fn createEntry(fat_ctx: *Self, blk: *BlockDevice, target: Cluster, name: EntryName, entry: EntryCreationType) !void {
+        pub fn createEntry(fat_ctx: *Self, blk: *BlockDevice, target: Cluster, name: EntryName, entry_info: EntryCreationInfo) !void {
             if (@sizeOf(LongContext) != 0)
-                @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call createDirectoryEntryContext instead.");
-            return fat_ctx.createDirectoryEntryContext(blk, target, name, entry, undefined);
+                @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call createEntryContext instead.");
+            return fat_ctx.createEntryContext(blk, target, name, entry_info, undefined);
         }
 
         // TODO: Maintain this bool return or return a named error?
-        pub fn createEntryContext(fat_ctx: *Self, blk: *BlockDevice, target: Cluster, name: EntryName, entry: EntryCreationType, ctx: LongContext) !void {
+        pub fn createEntryContext(fat_ctx: *Self, blk: *BlockDevice, target: Cluster, name: EntryName, entry: EntryCreationInfo, ctx: LongContext) !void {
             if (config.long_filenames) |_| {
                 // TODO
                 var dir_it = fat_ctx.directoryEntryIterator(.{ .skip_empty = false }, target);
@@ -775,6 +825,93 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     },
                 }
             } else fat_ctx.createShortEntry(blk, target, name, entry);
+        }
+
+        pub fn createShortEntry(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, name: []const u8, info: EntryCreationInfo) !void {
+            var dir_it = fat_ctx.directoryEntryIterator(cluster);
+            defer dir_it.deinit(blk);
+
+            const FreeSingleEntryData = struct { free_sector: BlockSector, free_entry: u8 };
+            var maybe_free: ?FreeSingleEntryData = while (try dir_it.next(blk)) |dirent| {
+                if (dirent.isFree()) {
+                    break FreeSingleEntryData{ .free_sector = dir_it.lastSector(), .free_entry = dir_it.lastSectorEntry() };
+                }
+            } else null;
+
+            while (true) {
+                if (maybe_free) |free| {
+                    const sector = try blk.map(free.free_sector);
+                    defer blk.unmap(free.free_sector, sector);
+
+                    const directory_entries: []DirectoryEntry = std.mem.bytesAsSlice(DirectoryEntry, sector.asSlice());
+                    directory_entries[free.free_entry] = info.asDirectoryEntry(sfn.codepageToShortFilename(name), @as(Cluster, 0), 0);
+
+                    try blk.commit(free.free_sector, sector);
+                    return;
+                }
+
+                const last_cluster = dir_it.current_cluster;
+                if (last_cluster == 0) {
+                    return EntryCreationError.OutOfRootDirectoryEntries;
+                }
+
+                const newly_allocated_cluster = try fat_ctx.extendAllocatedDirectoryClusters(blk, last_cluster, 1);
+                maybe_free = FreeSingleEntryData{ .free_sector = fat_ctx.cluster2Sector(newly_allocated_cluster), .free_entry = 0 };
+            }
+        }
+
+        inline fn extendAllocatedDirectoryClusters(fat_ctx: *Self, blk: *BlockDevice, chain_end: Cluster, n: usize) !Cluster {
+            const first_allocated = try fat_ctx.extendAllocatedClusters(blk, chain_end, n);
+
+            const sectors_per_cluster = (@as(u8, 1) << fat_ctx.misc.sectors_per_cluster);
+            const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
+
+            var current_cluster = first_allocated;
+            while (true) {
+                const initial_sector_index = fat_ctx.cluster2Sector(current_cluster);
+
+                for (0..sectors_per_cluster) |i| {
+                    const sector_index = initial_sector_index + i;
+                    const sector = try blk.map(sector_index);
+                    defer blk.unmap(sector_index, sector);
+
+                    const directories: []DirectoryEntry = @alignCast(std.mem.bytesAsSlice(DirectoryEntry, sector.asSlice()));
+
+                    // HACK: Is it better to memset it?
+                    for (0..directory_entries_per_sector) |d| {
+                        directories[d].name[0] = 0x00;
+                    }
+
+                    try blk.commit(sector_index, sector);
+                }
+
+                if (try fat_ctx.nextAllocatedCluster(blk, current_cluster, .read)) |next_cluster| {
+                    current_cluster = next_cluster;
+                    continue;
+                }
+
+                break;
+            }
+
+            return first_allocated;
+        }
+
+        inline fn extendAllocatedClusters(fat_ctx: *Self, blk: *BlockDevice, chain_end: Cluster, n: usize) !Cluster {
+            std.debug.assert(n > 0);
+
+            const first_next = try fat_ctx.linearSearchFreeCluster(blk, chain_end);
+
+            var current_cluster = first_next;
+            var current_allocated: usize = 1;
+            while (current_allocated < n) : (current_allocated += 1) {
+                const next_free = try fat_ctx.linearSearchFreeCluster(blk, current_cluster);
+
+                _ = try fat_ctx.queryFatEntry(blk, current_cluster, .{ .write = .{ .allocated = next_free } });
+                current_cluster = next_free;
+            }
+
+            _ = try fat_ctx.queryFatEntry(blk, current_cluster, .{ .write = .end_of_file });
+            return first_next;
         }
 
         inline fn directoryEntryIterator(fat_ctx: *Self, cluster: Cluster) DirectoryEntriesIterator {
@@ -882,9 +1019,9 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         }
 
         // TODO: Cache last free cluster and deleted clusters
-        pub fn searchFreeCluster(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) !Cluster {
+        pub inline fn linearSearchFreeCluster(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) !Cluster {
             var currentCluster: Cluster = start;
-            return while (currentCluster < fat_ctx.max_cluster) : (currentCluster += 1) e: {
+            return e: while (currentCluster <= fat_ctx.max_cluster) : (currentCluster += 1) {
                 switch (try fat_ctx.queryFatEntry(blk, currentCluster, .read)) {
                     .free => break :e currentCluster,
                     else => {},
@@ -892,19 +1029,18 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             } else ClusterError.OutOfClusters;
         }
 
-        pub fn nextAllocatedCluster(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, comptime query: FatQuery) !?Cluster {
+        pub inline fn nextAllocatedCluster(fat_ctx: *Self, blk: *BlockDevice, cluster: Cluster, query: FatQuery) !?Cluster {
             return switch (try fat_ctx.queryFatEntry(blk, cluster, query)) {
                 .allocated => |next_cluster| next_cluster,
                 .end_of_file => null,
-                else => |v| {
-                    std.debug.print("Invalid value {}\n", .{v});
-                    return ClusterError.InvalidClusterValue;
-                },
+                else => ClusterError.InvalidClusterValue,
             };
         }
 
-        pub const FatQuery = union(enum) { read, write: Cluster };
-        pub fn queryFatEntry(fat_ctx: *Self, blk: *BlockDevice, cluster_index: Cluster, comptime query: FatQuery) !TableEntry {
+        pub const FatQuery = union(enum) { read, write: TableEntry };
+        pub fn queryFatEntry(fat_ctx: *Self, blk: *BlockDevice, cluster_index: Cluster, query: FatQuery) !TableEntry {
+            std.debug.assert(cluster_index <= fat_ctx.max_cluster);
+
             // TODO: Cache the FAT and write entries when needed
             const fat_byte_index: usize = switch (config.maximum_supported_type) {
                 .fat12 => @as(usize, cluster_index) + (cluster_index >> 1),
@@ -935,7 +1071,9 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         if ((cluster_index & 1) == 0) {
                             switch (query) {
                                 .read => {},
-                                .write => |cluster| {
+                                .write => |entry| {
+                                    const cluster = entry.asClusterIndex(.fat12);
+
                                     first_bytes[bytes_per_sector_last] = @intCast(cluster & 0xFF);
                                     second_bytes[0] = @intCast((second_byte & 0xF0) | ((cluster >> 8) & 0xFF));
 
@@ -948,8 +1086,10 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         } else {
                             switch (query) {
                                 .read => {},
-                                .write => |cluster| {
-                                    first_bytes[bytes_per_sector_last] = @intCast((first_byte & 0x0F) | (@as(u8, cluster & 0x0F) << 4));
+                                .write => |entry| {
+                                    const cluster = entry.asClusterIndex(.fat12);
+
+                                    first_bytes[bytes_per_sector_last] = @intCast((first_byte & 0x0F) | (@as(u8, @intCast(cluster & 0x0F)) << 4));
                                     second_bytes[0] = @intCast((cluster >> 4) & 0xFF);
 
                                     try blk.commit(fat_sector_index, first_fat_sector);
@@ -966,8 +1106,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
                             switch (query) {
                                 .read => {},
-                                .write => |cluster| {
-                                    entry_ptr.* = @intCast(last_entry & 0xF000 | (cluster & 0xFFF));
+                                .write => |entry| {
+                                    entry_ptr.* = @intCast(last_entry & 0xF000 | (entry.asClusterIndex(.fat12) & 0xFFF));
                                     try blk.commit(fat_sector_index, first_fat_sector);
                                 },
                             }
@@ -977,8 +1117,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
                             switch (query) {
                                 .read => {},
-                                .write => |cluster| {
-                                    entry_ptr.* = @intCast((last_entry & 0x000F) | (@as(u16, cluster & 0xFFF) << 4));
+                                .write => |entry| {
+                                    entry_ptr.* = @intCast((last_entry & 0x000F) | (@as(u16, @intCast(entry.asClusterIndex(.fat12) & 0xFFF)) << 4));
                                     try blk.commit(fat_sector_index, first_fat_sector);
                                 },
                             }
@@ -986,55 +1126,40 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         }
                     };
 
-                    break :e switch (entry) {
-                        0x000 => .free,
-                        0xFF7 => .defective,
-                        0xFF8...0xFFF => .end_of_file,
-                        else => |v| if (v <= fat_ctx.max_cluster) .{ .allocated = v } else .reserved,
-                    };
+                    break :e TableEntry.fromClusterIndex(entry, fat_ctx.max_cluster, .fat12);
                 },
                 inline else => |t| if (config.maximum_supported_type == .fat12) unreachable else e: {
                     const fat_sector = try blk.map(fat_sector_index);
                     defer blk.unmap(fat_sector_index, fat_sector);
 
                     break :e switch (t) {
-                        .fat16 => v: {
+                        .fat16 => {
                             const entry_ptr: *u16 = @alignCast(@ptrCast(fat_sector.asSlice()[fat_sector_offset..][0..2]));
                             const last_entry = entry_ptr.*;
 
                             switch (query) {
                                 .read => {},
-                                .write => |cluster| {
-                                    entry_ptr.* = cluster;
+                                .write => |entry| {
+                                    entry_ptr.* = @intCast(entry.asClusterIndex(.fat16) & 0xFFFF);
                                     try blk.commit(fat_sector_index, fat_sector);
                                 },
                             }
 
-                            break :v switch (last_entry) {
-                                0x0000 => .free,
-                                0xFFF7 => .defective,
-                                0xFFF8...0xFFFF => .end_of_file,
-                                else => |v| if (v <= fat_ctx.max_cluster) .{ .allocated = v } else .reserved,
-                            };
+                            break :e TableEntry.fromClusterIndex(last_entry, fat_ctx.max_cluster, .fat16);
                         },
-                        .fat32 => if (config.maximum_supported_type == .fat16) unreachable else v: {
+                        .fat32 => if (config.maximum_supported_type == .fat16) unreachable else {
                             const entry_ptr: *u32 = @alignCast(@ptrCast(fat_sector.asSlice()[fat_sector_offset..][0..4]));
                             const last_entry = entry_ptr.*;
 
                             switch (query) {
                                 .read => {},
-                                .write => |cluster| {
-                                    entry_ptr.* = ((last_entry & 0xF0000000) | (cluster & 0x0FFFFFFF));
+                                .write => |entry| {
+                                    entry_ptr.* = ((last_entry & 0xF0000000) | (entry.asClusterIndex(.fat32) & 0x0FFFFFFF));
                                     try blk.commit(fat_sector_index, fat_sector);
                                 },
                             }
 
-                            break :v switch (last_entry) {
-                                0x0000000 => .free,
-                                0xFFFFFF7 => .defective,
-                                0xFFFFFF8...0xFFFFFFFF => .end_of_file,
-                                else => |v| if (v <= fat_ctx.max_cluster) .{ .allocated = v } else .reserved,
-                            };
+                            break :e TableEntry.fromClusterIndex(last_entry, fat_ctx.max_cluster, .fat32);
                         },
                         else => unreachable,
                     };

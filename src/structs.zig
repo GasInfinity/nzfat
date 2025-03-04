@@ -57,13 +57,13 @@ pub const FSInfo32 = extern struct {
 };
 
 pub const Attributes = packed struct(u8) {
-    read_only: bool,
-    hidden: bool,
-    system: bool,
-    volume_id: bool,
-    directory: bool,
-    archive: bool,
-    _: u2,
+    read_only: bool = false,
+    hidden: bool = false,
+    system: bool = false,
+    volume_id: bool = false,
+    directory: bool = false,
+    archive: bool = false,
+    _: u2 = 0,
 
     pub fn isLongName(attributes: Attributes) bool {
         return attributes.read_only and attributes.hidden and attributes.hidden and attributes.volume_id;
@@ -83,9 +83,11 @@ pub const Time = packed struct(u16) { seconds: u5, minutes: u6, hours: u5 };
 pub const Date = packed struct(u16) { day: u5, month: u4, year: u7 };
 
 pub const DirectoryEntry = extern struct {
+    pub const deletion_flag = 0xE5;
+
     name: [11]u8 align(1),
     attributes: Attributes align(1),
-    reserved: u8 align(1),
+    reserved: u8 align(1) = 0,
     creation_time_tenth: u8 align(1),
     creation_time: Time align(1),
     creation_date: Date align(1),
