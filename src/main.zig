@@ -1,5 +1,5 @@
 const std = @import("std");
-const zfat = @import("zfat");
+const nzfat = @import("nzfat");
 
 const FileBlockContext = struct {
     const BlockSizeError = error{
@@ -44,7 +44,7 @@ const FileBlockContext = struct {
     }
 };
 
-const Fat = zfat.FatFilesystem(FileBlockContext, .{});
+const Fat = nzfat.FatFilesystem(FileBlockContext, .{});
 const StringBuilder = std.ArrayList(u8);
 const DirectoryStack = std.ArrayList(Fat.Cluster);
 
@@ -78,7 +78,7 @@ pub fn main() !void {
     var floppy_blk_ctx = FileBlockContext{ .allocator = alloc, .fd = floppy_file, .logical_block_size = 512 };
 
     var fat_ctx = Fat.mount(&floppy_blk_ctx) catch |err| switch (err) {
-        zfat.MountError.InvalidBackupSector, zfat.MountError.InvalidBootSignature, zfat.MountError.InvalidBytesPerSector, zfat.MountError.InvalidFatSize, zfat.MountError.InvalidJump, zfat.MountError.InvalidMediaType, zfat.MountError.InvalidReservedSectorCount, zfat.MountError.InvalidRootEntries, zfat.MountError.InvalidSectorCount, zfat.MountError.InvalidSectorsPerCluster, zfat.MountError.UnsupportedFat => {
+        nzfat.MountError.InvalidBackupSector, nzfat.MountError.InvalidBootSignature, nzfat.MountError.InvalidBytesPerSector, nzfat.MountError.InvalidFatSize, nzfat.MountError.InvalidJump, nzfat.MountError.InvalidMediaType, nzfat.MountError.InvalidReservedSectorCount, nzfat.MountError.InvalidRootEntries, nzfat.MountError.InvalidSectorCount, nzfat.MountError.InvalidSectorsPerCluster, nzfat.MountError.UnsupportedFat => {
             try stdout.print("The image does not contain a valid FAT filesystem: {s}", .{@errorName(err)});
             return;
         },

@@ -1,4 +1,4 @@
-# ⚡ zfat (WIP)
+# ⚡ nzfat (WIP)
 A very generic and configurable FAT12/16/32 implementation library with VFAT support written in zig.
 Almost all the features are configurable, from long filename support (and the max number of characters it supports) to the maximum supported FAT type (12/16/32).
 
@@ -12,8 +12,8 @@ The `FatFilesystem` type only needs two arguments, the block device context and 
 
 For example, mounting a FAT filesystem might be done like this:
 ```zig
-const zfat = @import("zfat");
-const Fat = zfat.FatFilesystem(...);
+const nzfat = @import("nzfat");
+const Fat = nzfat.FatFilesystem(...);
 // ...
 var fat_ctx = try Fat.mount(&blk);
 // See zfat.MountError
@@ -22,7 +22,7 @@ var fat_ctx = try Fat.mount(&blk);
 To traverse the directory entries you have `directoryIterator` and `directoryIteratorContext` at your disposal:
 ```zig
 // TODO: Explain why directoryIteratorContext is sometimes needed for long filenames.
-var dir_it = fat_ctx.directoryIterator(Fat.root_directory_handle);
+var dir_it = fat_ctx.directoryIterator(fat_ctx.getRoot());
 defer dir_it.deinit();
 
 while (try dir_it.next(&blk)) |entry| : (entries += 1) {
@@ -39,8 +39,19 @@ if(try fat_ctx.searchEntry(&blk, handle, name)) |entry| {
 ```
 
 ## 📝 TODO
-- [ ] Searching for N free entries in a directory
+
+### Small TODO's
+- [x] Searching for 1 free entry in a directory (a.k.a: Short filename only)
+- [x] Searching for a free cluster linearly
+- [x] Deletion of files and directories
+- [x] Short filename alternatives when using a VFAT `FatFilesystem`
+- [ ] Searching for N free clusters for file and directory creation
 - [ ] Allocate new directory entries if no entries found and not in root (FAT12/16 only)
 - [ ] Creation of directory entries with LFN entries if needed
-- [ ] Searching for N free clusters for file and directory creation
-- [ ] API to allocate files and write to them 
+- [ ] Searching for N free entries in a directory
+- [ ] API to allocate clusters for files
+
+### Big TODO's
+- [ ] Implement some sort of I/O cache? Or leave it to the BlockDevice implementation?
+- [ ] Some sort of cache strategy for FAT entries if requested.
+- [ ] Reorganize/rename and API Freeze

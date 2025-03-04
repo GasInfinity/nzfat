@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib = b.addModule("zfat", .{
+    const lib = b.addModule("nzfat", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
@@ -12,13 +12,13 @@ pub fn build(b: *std.Build) void {
 
     // This is a simple test app to open images
     const exe = b.addExecutable(.{
-        .name = "zfat",
+        .name = "nzfat",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    exe.root_module.addImport("zfat", lib);
+    exe.root_module.addImport("nzfat", lib);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
