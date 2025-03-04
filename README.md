@@ -45,11 +45,12 @@ if(try fat_ctx.searchEntry(&blk, handle, name)) |entry| {
 - [x] Searching for a free cluster linearly
 - [x] Deletion of files and directories
 - [x] Short filename alternatives when using a VFAT `FatFilesystem`
-- [ ] Searching for N free clusters for file and directory creation
-- [ ] Allocate new directory entries if no entries found and not in root (FAT12/16 only)
+- [x] Searching for N free clusters for file and directory creation
+- [x] Allocate new directory entries if no entries found and not in root (FAT12/16 only)
 - [ ] Creation of directory entries with LFN entries if needed
 - [ ] Searching for N free entries in a directory
-- [ ] API to allocate clusters for files
+- [x] API to allocate clusters for files
+- [ ] API to modify dates and times and attributes in entries
 
 ### Big TODO's
 - [ ] Implement some sort of I/O cache? Or leave it to the BlockDevice implementation?
