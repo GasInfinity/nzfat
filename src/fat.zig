@@ -84,6 +84,8 @@ pub const Date = packed struct(u16) { day: u5, month: u4, year: u7 };
 
 pub const DirectoryEntry = extern struct {
     pub const deletion_flag = 0xE5;
+    pub const dot_name = ".          ";
+    pub const dot_dot_name = "..         ";
 
     name: [11]u8 align(1),
     attributes: Attributes align(1),

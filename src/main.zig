@@ -50,7 +50,7 @@ const FileBlockContext = struct {
 
 const Fat = nzfat.FatFilesystem(FileBlockContext, .{});
 const StringBuilder = std.ArrayList(u8);
-const DirectoryStack = std.ArrayList(Fat.Cluster);
+const DirectoryStack = std.ArrayList(?Fat.DirectoryEntry);
 
 const Command = enum {
     cd,
@@ -97,7 +97,7 @@ pub fn main() !void {
 
     var current_dir = DirectoryStack.init(alloc);
     defer current_dir.deinit();
-    try current_dir.append(fat_ctx.getRoot());
+    try current_dir.append(null);
 
     var buf: [256]u8 = undefined;
     while (true) {
@@ -121,33 +121,36 @@ pub fn main() !void {
                 .cd => {
                     const next_path = command_args;
 
-                    if (next_path.len == 1 and next_path[0] == '.') {
+                    if (std.mem.eql(u8, next_path, ".")) {
+                        continue;
+                    }
+
+                    if (std.mem.eql(u8, next_path, "..")) {
+                        if (current_dir.items.len == 1) {
+                            continue;
+                        }
+
+                        _ = current_dir.pop();
+                        _ = current_path.pop();
+
+                        while (current_path.pop() != '/') {}
+                        try current_path.append('/');
                         continue;
                     }
 
                     const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
                     defer alloc.free(utf16_next_path);
 
-                    if (try fat_ctx.searchEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |ent| {
-                        if (!ent.attributes.directory) {
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
+                        if (found.type != .directory) {
                             try stdout.print("Cannot change directory into a file!\n", .{});
                             continue;
                         }
 
-                        const new_target = ent.cluster;
-                        try stdout.print("cd: {} => {}\n", .{ current_dir.items[current_dir.items.len - 1], new_target });
-
-                        if (current_dir.items.len > 1 and std.meta.eql(current_dir.items[current_dir.items.len - 2], new_target)) {
-                            _ = current_dir.pop();
-                            _ = current_path.pop();
-
-                            while (current_path.pop() != '/') {}
-                            try current_path.append('/');
-                        } else {
-                            try current_path.appendSlice(next_path);
-                            try current_path.append('/');
-                            try current_dir.append(ent.cluster);
-                        }
+                        try stdout.print("cd: {?} => {}\n", .{ current_dir.items[current_dir.items.len - 1], found });
+                        try current_path.appendSlice(next_path);
+                        try current_path.append('/');
+                        try current_dir.append(found);
                     } else {
                         try stdout.print("Directory not found.\n", .{});
                     }
@@ -158,75 +161,76 @@ pub fn main() !void {
                     const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
                     defer alloc.free(utf16_next_path);
 
-                    if (try fat_ctx.searchEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |ent| {
-                        if (ent.attributes.directory) {
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
+                        if (found.type != .file) {
                             try stdout.print("Cannot cat a directory!\n", .{});
                             continue;
                         }
-                        try stdout.print("Contents of file: {s} - CLUSTER {}\n", .{ next_path, ent.cluster });
-                        const sectors_per_cluster = @as(usize, 1) << fat_ctx.misc.sectors_per_cluster;
 
-                        var current_read_index: usize = 0;
-                        var current_cluster = ent.cluster;
-                        reading: while (true) {
-                            const cluster_sector = fat_ctx.cluster2Sector(current_cluster);
-                            var current_sector: usize = 0;
+                        // TODO: Write the abstraction for reading and writing files safely
+                        // try stdout.print("Contents of file: {s} - CLUSTER {}\n", .{ next_path, ent.cluster });
+                        // const sectors_per_cluster = @as(usize, 1) << fat_ctx.misc.sectors_per_cluster;
+                        //
+                        // var current_read_index: usize = 0;
+                        // var current_cluster = ent.cluster;
+                        // reading: while (true) {
+                        //     const cluster_sector = fat_ctx.cluster2Sector(current_cluster);
+                        //     var current_sector: usize = 0;
+                        //
+                        //     while (current_sector < sectors_per_cluster) : (current_sector += 1) {
+                        //         const sc = cluster_sector + current_sector;
+                        //         const read = try floppy_blk_ctx.map(sc);
+                        //         defer floppy_blk_ctx.unmap(sc, read);
+                        //
+                        //         current_read_index += floppy_blk_ctx.logical_block_size;
+                        //
+                        //         if (current_read_index >= ent.file_size) {
+                        //             const remaining = ent.file_size - (current_read_index - floppy_blk_ctx.logical_block_size);
+                        //
+                        //             try stdout.print("{s}", .{read.asSlice()[0..remaining]});
+                        //             break :reading;
+                        //         } else {
+                        //             try stdout.print("{s}", .{read.asSlice()});
+                        //         }
+                        //     }
+                        //
+                        //     current_sector = 0;
+                        //
+                        //     if (try fat_ctx.queryNextAllocatedCluster(&floppy_blk_ctx, current_cluster, .read)) |next| {
+                        //         current_cluster = next;
+                        //         try stdout.print("NEXT CLUSTER => {}", .{next});
+                        //     } else {
+                        //         std.debug.assert(current_read_index == ent.file_size);
+                        //         break :reading;
+                        //     }
+                        // }
+                        //
 
-                            while (current_sector < sectors_per_cluster) : (current_sector += 1) {
-                                const sc = cluster_sector + current_sector;
-                                const read = try floppy_blk_ctx.map(sc);
-                                defer floppy_blk_ctx.unmap(sc, read);
-
-                                current_read_index += floppy_blk_ctx.logical_block_size;
-
-                                if (current_read_index >= ent.file_size) {
-                                    const remaining = ent.file_size - (current_read_index - floppy_blk_ctx.logical_block_size);
-
-                                    try stdout.print("{s}", .{read.asSlice()[0..remaining]});
-                                    break :reading;
-                                } else {
-                                    try stdout.print("{s}", .{read.asSlice()});
-                                }
-                            }
-
-                            current_sector = 0;
-
-                            if (try fat_ctx.nextAllocatedCluster(&floppy_blk_ctx, current_cluster, .read)) |next| {
-                                current_cluster = next;
-                                try stdout.print("NEXT CLUSTER => {}", .{next});
-                            } else {
-                                std.debug.assert(current_read_index == ent.file_size);
-                                break :reading;
-                            }
-                        }
-
-                        try stdout.print("File size: {} bytes\n", .{ent.file_size});
+                        try stdout.print("File size: {} bytes\n", .{found.file_size});
                     } else {
                         try stdout.print("File not found.\n", .{});
                     }
                 },
                 .mkdir => {
-                    if (try fat_ctx.searchShortEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], "testing.txt") == null) {
-                        try fat_ctx.createShortEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], "testing.txt", .{ .type = .{ .file = 0 } });
+                    const next_path = command_args;
+                    if (try fat_ctx.searchShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path) == null) {
+                        _ = try fat_ctx.createShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path, .{ .type = .{ .directory = 2 } });
                     } else {
-                        try stdout.print("File already exists!\n", .{});
+                        try stdout.print("Directory already exists!\n", .{});
                     }
-
-                    try stdout.print("TODO Handle paths\n", .{});
-                    // TODO
                 },
                 .rm => {
                     const next_path = command_args;
 
                     const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
                     defer alloc.free(utf16_next_path);
-                    if (try fat_ctx.searchEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
-                        if (found.attributes.directory) {
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
+                        if (found.type != .file) {
                             try stdout.print("Use rmdir to delete directories\n", .{});
                             continue;
                         }
 
-                        try fat_ctx.deleteEntry(&floppy_blk_ctx, found);
+                        try fat_ctx.delete(&floppy_blk_ctx, found);
                     } else {
                         try stdout.print("File not found\n", .{});
                     }
@@ -237,19 +241,19 @@ pub fn main() !void {
                     const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
                     defer alloc.free(utf16_next_path);
 
-                    if (try fat_ctx.searchEntry(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
-                        if (!found.attributes.directory) {
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
+                        if (found.type != .directory) {
                             try stdout.print("Use rm to delete files\n", .{});
                             continue;
                         }
 
                         // TODO: Check if directory can be deleted (i.e: '.' and '..')
-                        if (!try fat_ctx.isDirectoryEmpty(&floppy_blk_ctx, found.cluster)) {
+                        if (!try fat_ctx.isDirectoryEmpty(&floppy_blk_ctx, found)) {
                             try stdout.print("You can only delete empty directories\n", .{});
                             continue;
                         }
 
-                        try fat_ctx.deleteEntry(&floppy_blk_ctx, found);
+                        try fat_ctx.delete(&floppy_blk_ctx, found);
                     }
                 },
                 // XXX: Yes, I know... this is reachable...
@@ -265,7 +269,7 @@ pub fn main() !void {
 
             switch (command.?) {
                 .ls => {
-                    var dir_it = fat_ctx.directoryIterator(current_dir.items[current_dir.items.len - 1]);
+                    var dir_it = fat_ctx.directoryEntryIterator(current_dir.items[current_dir.items.len - 1]);
                     defer dir_it.deinit(&floppy_blk_ctx);
 
                     var entries: usize = 0;

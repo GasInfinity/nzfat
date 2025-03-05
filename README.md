@@ -19,21 +19,31 @@ var fat_ctx = try Fat.mount(&blk);
 // See zfat.MountError
 ```
 
-To traverse the directory entries you have `directoryIterator` and `directoryIteratorContext` at your disposal:
+To traverse the directory entries you have `directoryEntryIterator` at your disposal:
 ```zig
 // TODO: Explain why directoryIteratorContext is sometimes needed for long filenames.
-var dir_it = fat_ctx.directoryIterator(fat_ctx.getRoot());
+var dir_it = fat_ctx.directoryEntryIterator(null); // NOTE: null is the root directory
 defer dir_it.deinit();
 
-while (try dir_it.next(&blk)) |entry| : (entries += 1) {
-    // Do something with entry 
+std.debug.print("- Listing entries at /\n");
+while (try dir_it.next(&blk)) |it_entry| : (entries += 1) {
+    // Do something with it_entry
+    std.debug.print("- {s}", .{it_entry.sfn});
+
+    // NOTE: Only if enabled in the config, if not it_entry.lfn will be void!
+    if(it_entry.lfn) |lfn| {
+        std.debug.print(" ({s})", utf16ToUtf8(lfn));
+    }
+
+    std.debug.print("\n", .{});
 }
 ```
 
-As searching for a specific entry in a directory is very common, `searchEntry` and `searchEntryContext` abstract away the case-insensitive nature of the filesystem:
+As searching for a specific entry in a directory is very common, `search`, `searchContext` and `searchShort` abstract away the case-insensitive nature of the filesystem:
 ```zig
 // TODO: Explain that for long filenames a case-insensitive comparison function must be provided as its out of scope for this project
-if(try fat_ctx.searchEntry(&blk, handle, name)) |entry| {
+if(try fat_ctx.search(&blk, handle, name)) |entry| {
+    std.debug.print("'{s}' found! Is a {}", .{utf8_name, @tagName(entry.type)});
     // Do something with the entry we found...
 }
 ```
@@ -41,18 +51,31 @@ if(try fat_ctx.searchEntry(&blk, handle, name)) |entry| {
 ## 📝 TODO
 
 ### Small TODO's
+- [ ] Update to zig 0.14.0
+
 - [x] Searching for 1 free entry in a directory (a.k.a: Short filename only)
 - [x] Searching for a free cluster linearly
 - [x] Deletion of files and directories
-- [x] Short filename alternatives when using a VFAT `FatFilesystem`
+- [x] Short filename alternatives for functions when using a VFAT `FatFilesystem`
 - [x] Searching for N free clusters for file and directory creation
 - [x] Allocate new directory entries if no entries found and not in root (FAT12/16 only)
-- [ ] Creation of directory entries with LFN entries if needed
-- [ ] Searching for N free entries in a directory
-- [x] API to allocate clusters for files
-- [ ] API to modify dates and times and attributes in entries
+- [x] Allocate clusters for files
+- [x] Creation of files and directories with short names
+- [x] API to modify dates and times and attributes in entries
+- [ ] API for reading and writing file contents
+- [ ] Searching for N free entries in a directory and creation of directory entries with LFN entries if needed.
+- [ ] Create fat formatted media
+- [ ] Utility check and 'fix' fat filesystem
+- [ ] Utility to write files given a buffer (a.k.a: writeAllBytes)
+- [ ] Comptime utility function to create directories and files given a comptime known path (Really useful!)
+- [ ] Comptime utility function to search for directories and files given a comptime known path (Really useful!)
 
 ### Big TODO's
+- [x] Reorganize/rename things
+- [ ] Behaviour tests
+- [ ] Rewrite codepage name handling
+- [ ] Rewrite UCS-2 name handling
+
 - [ ] Implement some sort of I/O cache? Or leave it to the BlockDevice implementation?
 - [ ] Some sort of cache strategy for FAT entries if requested.
-- [ ] Reorganize/rename and API Freeze
+- [ ] API Freeze
