@@ -1,5 +1,45 @@
 const std = @import("std");
 
+pub const min_bytes_per_sector = 512;
+pub const min_bytes_per_sector_shift = std.math.log2(min_bytes_per_sector);
+
+pub const max_sectors_per_cluster = 128;
+pub const max_sectors_per_cluster_shift = std.math.log2(max_sectors_per_cluster);
+
+pub const Type = enum(u2) { fat12, fat16, fat32 };
+pub const min_clusters = std.EnumArray(Type, u32).initDefault(null, .{
+    .fat12 = 0x1,
+    .fat16 = 0xFF5,
+    .fat32 = 0xFFF5,
+});
+
+pub const max_clusters = std.EnumArray(Type, u32).initDefault(null, .{
+    .fat12 = 0xFF4,
+    .fat16 = 0xFFF4,
+    .fat32 = 0xFFFFFF6,
+});
+
+// NOTE: These are used in the formula -> (cluster_index + cluster_index >> div_shift) << mul_shift
+pub const mul_shift = std.EnumArray(Type, u1).initDefault(null, .{
+    .fat12 = 0,
+    .fat16 = 0,
+    .fat32 = 1,
+});
+
+pub const div_shift = std.EnumArray(Type, u1).initDefault(null, .{
+    .fat12 = 1,
+    .fat16 = 0,
+    .fat32 = 0,
+});
+
+pub fn SuggestCluster(comptime maximum_supported_fat_type: Type) type {
+    return switch (maximum_supported_fat_type) {
+        .fat12 => u12,
+        .fat16 => u16,
+        .fat32 => u32,
+    };
+}
+
 pub const BiosParameterBlock = extern struct {
     jmp: [3]u8 align(1),
     oem_identifier: [8]u8 align(1),
@@ -20,28 +60,28 @@ pub const BiosParameterBlock = extern struct {
 pub const ExtendedBootRecord = extern struct {
     drive_number: u8 align(1),
     nt_flags: u8 align(1),
-    signature: u8 align(1) = 0x28,
+    signature: u8 align(1) = 0x29,
     volume_id: [4]u8 align(1),
     label: [11]u8 align(1),
-    system_identifier: [8]u8 align(1),
+    system_identifier: [8]u8 align(1) = "FAT     ".*,
     boot_code: [448]u8,
     boot_signature: u16 = 0xAA55,
 };
 
 pub const ExtendedBootRecord32 = extern struct {
     sectors_per_fat: u32 align(1),
-    flags: u16 align(1),
+    flags: u16 align(1), // FIXME: This must be a packed struct
     fat_version: u16 align(1),
     root_cluster: u32 align(1),
     fsinfo_sector: u16 align(1),
     backup_boot_sector: u16 align(1),
-    reserved: [12]u8 align(1),
+    reserved: [12]u8 align(1) = std.mem.zeroes([12]u8),
     drive_number: u8 align(1),
     nt_flags: u8 align(1),
     signature: u8 align(1) = 0x28,
     volume_id: [4]u8 align(1),
     label: [11]u8 align(1),
-    system_identifier: [8]u8 align(1),
+    system_identifier: [8]u8 align(1) = "FAT32   ".*,
     boot_code: [420]u8,
     boot_signature: u16 = 0xAA55,
 };

@@ -64,7 +64,7 @@ if(try fat_ctx.search(&blk, handle, name)) |entry| {
 - [x] API to modify dates and times and attributes in entries
 - [ ] API for reading and writing file contents
 - [ ] Searching for N free entries in a directory and creation of directory entries with LFN entries if needed.
-- [ ] Create fat formatted media
+- [x] Create fat formatted media
 - [ ] Utility check and 'fix' fat filesystem
 - [ ] Utility to write files given a buffer (a.k.a: writeAllBytes)
 - [ ] Comptime utility function to create directories and files given a comptime known path (Really useful!)

@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const fat = @import("fat.zig");
 pub const sfn = @import("sfn.zig");
+pub const format = @import("format.zig");
 
 const BiosParameterBlock = fat.BiosParameterBlock;
 const ExtendedBootRecord = fat.ExtendedBootRecord;
@@ -13,10 +14,9 @@ const LongFileNameEntry = fat.LongFileNameEntry;
 
 pub const Time = fat.Time;
 pub const Date = fat.Date;
+pub const Type = fat.Type;
 
 // TODO: Maybe reorganize this
-
-pub const FatType = enum(u2) { fat12, fat16, fat32 };
 
 pub const MountError = error{
     /// Invalid jump code, it must be 0xEB or 0xE9
@@ -86,7 +86,7 @@ pub const Config = struct {
     };
 
     /// The maximum supported FAT of the FatFilesystem, affects code size.
-    maximum_supported_type: FatType = .fat32,
+    maximum_supported_type: Type = .fat32,
 
     /// Whether the FatFilesystem supports the VFAT extension for long filenames, affects code size greatly.
     long_filenames: ?LongFilenameConfig = LongFilenameConfig{},
@@ -147,7 +147,7 @@ pub const ClusterError = error{ InvalidClusterValue, OutOfClusters };
 pub const EntryCreationError = error{OutOfRootDirectoryEntries};
 pub const EntryDeletionError = error{NonEmptyDirectory};
 
-const MiscData = packed struct(u16) { type: FatType, mul: u1, div: u1, bytes_per_sector: u4, sectors_per_cluster: u3, directory_entries_per_sector: u3, _: u2 = 0 };
+const MiscData = packed struct(u16) { type: Type, mul: u1, div: u1, bytes_per_sector: u4, sectors_per_cluster: u3, directory_entries_per_sector: u3, _: u2 = 0 };
 const allowed_media_values = [_]u8{ 0xF0, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF };
 
 /// Implements a FAT Filesystem as specified in official documentation with support for its VFAT extension.
@@ -159,12 +159,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         const BlockSector = BlockDevice.Sector;
         const BlockSectorResult = BlockDevice.SectorResult;
 
-        pub const Cluster = switch (config.maximum_supported_type) {
-            .fat32 => u32,
-            .fat16 => u16,
-            .fat12 => u12,
-        };
-
+        pub const Cluster = fat.SuggestCluster(config.maximum_supported_type);
         pub const FatSize = switch (config.maximum_supported_type) {
             .fat32 => u32,
             else => u16,
@@ -198,7 +193,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             reserved,
             end_of_file,
 
-            pub inline fn fromClusterIndex(cluster_index: Cluster, max_cluster: Cluster, fat_type: FatType) TableEntry {
+            pub inline fn fromClusterIndex(cluster_index: Cluster, max_cluster: Cluster, fat_type: Type) TableEntry {
                 return switch (cluster_index) {
                     0x0 => .free,
                     else => |c| if (c <= max_cluster) .{ .allocated = c } else switch (fat_type) {
@@ -319,14 +314,42 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             const cluster_count: Cluster = @intCast(data_sectors >> sectors_per_cluster_shift);
             const max_cluster: Cluster = cluster_count + 1;
 
-            const fat_type: FatType = if (cluster_count < 4085) .fat12 else if (cluster_count < 65525) .fat16 else .fat32;
+            const fat_type: Type = if (cluster_count <= fat.max_clusters.get(.fat12)) .fat12 else if (cluster_count <= fat.max_clusters.get(.fat16)) .fat16 else .fat32;
 
-            return switch (config.maximum_supported_type) {
-                .fat12 => if (fat_type != .fat12) MountError.UnsupportedFat else Self{
+            return switch (fat_type) {
+                .fat32 => if (config.maximum_supported_type != .fat32) MountError.UnsupportedFat else ctx: {
+                    if (root_entries != 0) {
+                        return MountError.InvalidRootEntries;
+                    }
+
+                    if (ebr32.backup_boot_sector != 6) {
+                        return MountError.InvalidBackupSector;
+                    }
+
+                    const root_entry_cluster = std.mem.readInt(u32, std.mem.asBytes(&ebr32.root_cluster), .little);
+
+                    break :ctx Self{
+                        .misc = .{
+                            .type = .fat32,
+                            .mul = fat.mul_shift.get(.fat32),
+                            .div = fat.div_shift.get(.fat32),
+                            .bytes_per_sector = bytes_per_sector_shift,
+                            .sectors_per_cluster = sectors_per_cluster_shift,
+                            .directory_entries_per_sector = directory_entries_per_sector_shift,
+                        },
+                        .root_entry_data = RootDirectoryData{ .cluster = root_entry_cluster },
+                        .fats = fats,
+                        .fat_size = fat_size,
+                        .reserved_sector_count = reserved_sector_count,
+                        .data_sector_start = data_sector_start,
+                        .max_cluster = max_cluster,
+                    };
+                },
+                else => |t| if (config.maximum_supported_type == .fat12 and t == .fat16) MountError.UnsupportedFat else Self{
                     .misc = .{
-                        .type = .fat12,
-                        .mul = 0,
-                        .div = 1,
+                        .type = t,
+                        .mul = fat.mul_shift.get(t),
+                        .div = fat.div_shift.get(t),
                         .bytes_per_sector = bytes_per_sector_shift,
                         .sectors_per_cluster = sectors_per_cluster_shift,
                         .directory_entries_per_sector = directory_entries_per_sector_shift,
@@ -338,71 +361,6 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     .data_sector_start = data_sector_start,
                     .max_cluster = max_cluster,
                 },
-                .fat16 => switch (fat_type) {
-                    .fat32 => MountError.UnsupportedFat,
-                    inline else => |t| Self{
-                        .misc = .{
-                            .type = t,
-                            .mul = 0,
-                            .div = comptime if (t == .fat12) 1 else 0,
-                            .bytes_per_sector = bytes_per_sector_shift,
-                            .sectors_per_cluster = sectors_per_cluster_shift,
-                            .directory_entries_per_sector = directory_entries_per_sector_shift,
-                        },
-                        .root_entry_data = RootDirectoryData{ .sector_info = .{ .sectors = root_entries_sectors } },
-                        .fats = fats,
-                        .fat_size = fat_size,
-                        .reserved_sector_count = reserved_sector_count,
-                        .data_sector_start = data_sector_start,
-                        .max_cluster = max_cluster,
-                    },
-                },
-                .fat32 => switch (fat_type) {
-                    .fat32 => ctx: {
-                        if (root_entries != 0) {
-                            return MountError.InvalidRootEntries;
-                        }
-
-                        if (ebr32.backup_boot_sector != 6) {
-                            return MountError.InvalidBackupSector;
-                        }
-
-                        const root_entry_cluster = std.mem.readInt(u32, std.mem.asBytes(&ebr32.root_cluster), .little);
-
-                        break :ctx Self{
-                            .misc = .{
-                                .type = .fat32,
-                                .mul = 1,
-                                .div = 0,
-                                .bytes_per_sector = bytes_per_sector_shift,
-                                .sectors_per_cluster = sectors_per_cluster_shift,
-                                .directory_entries_per_sector = directory_entries_per_sector_shift,
-                            },
-                            .root_entry_data = RootDirectoryData{ .cluster = root_entry_cluster },
-                            .fats = fats,
-                            .fat_size = fat_size,
-                            .reserved_sector_count = reserved_sector_count,
-                            .data_sector_start = data_sector_start,
-                            .max_cluster = max_cluster,
-                        };
-                    },
-                    inline else => |t| Self{
-                        .misc = .{
-                            .type = t,
-                            .mul = 0,
-                            .div = comptime if (t == .fat12) 1 else 0,
-                            .bytes_per_sector = bytes_per_sector_shift,
-                            .sectors_per_cluster = sectors_per_cluster_shift,
-                            .directory_entries_per_sector = directory_entries_per_sector_shift,
-                        },
-                        .root_entry_data = RootDirectoryData{ .sector_info = .{ .sectors = root_entries_sectors } },
-                        .fats = fats,
-                        .fat_size = fat_size,
-                        .reserved_sector_count = reserved_sector_count,
-                        .data_sector_start = data_sector_start,
-                        .max_cluster = max_cluster,
-                    },
-                },
             };
         }
 
@@ -411,7 +369,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             _ = blk;
         }
 
-        pub inline fn getType(fat_ctx: Self) FatType {
+        pub inline fn getType(fat_ctx: Self) Type {
             return if (config.maximum_supported_type == .fat12) .fat12 else fat_ctx.misc.type;
         }
 
@@ -1168,6 +1126,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             };
         }
 
+        // TODO: Query the other FAT's when needed
         fn queryFatEntry(fat_ctx: *Self, blk: *BlockDevice, cluster_index: Cluster, comptime query: FatQuery, value: (if (query == .write) TableEntry else void)) !TableEntry {
             std.debug.assert(cluster_index <= fat_ctx.max_cluster);
 
@@ -1297,4 +1256,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             };
         }
     };
+}
+
+test {
+    _ = format;
 }

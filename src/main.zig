@@ -46,6 +46,14 @@ const FileBlockContext = struct {
 
         ctx.logical_block_size = new_logical_block_size;
     }
+
+    pub fn getLogicalBlockSize(ctx: *FileBlockContext) usize {
+        return ctx.logical_block_size;
+    }
+
+    pub fn getSize(ctx: *FileBlockContext) usize {
+        return (ctx.fd.getEndPos() catch unreachable) / ctx.logical_block_size;
+    }
 };
 
 const Fat = nzfat.FatFilesystem(FileBlockContext, .{});
@@ -79,7 +87,10 @@ pub fn main() !void {
     }
 
     const floppy_file = try std.fs.cwd().openFile(args[1], .{ .mode = .read_write });
+    // try floppy_file.setEndPos(2880 * 512);
+
     var floppy_blk_ctx = FileBlockContext{ .allocator = alloc, .fd = floppy_file, .logical_block_size = 512 };
+    // try nzfat.format.make(&floppy_blk_ctx, .{ .volume_id = std.mem.zeroes([4]u8) });
 
     var fat_ctx = Fat.mount(&floppy_blk_ctx) catch |err| switch (err) {
         nzfat.MountError.InvalidBackupSector, nzfat.MountError.InvalidBootSignature, nzfat.MountError.InvalidBytesPerSector, nzfat.MountError.InvalidFatSize, nzfat.MountError.InvalidJump, nzfat.MountError.InvalidMediaType, nzfat.MountError.InvalidReservedSectorCount, nzfat.MountError.InvalidRootEntries, nzfat.MountError.InvalidSectorCount, nzfat.MountError.InvalidSectorsPerCluster, nzfat.MountError.UnsupportedFat => {
