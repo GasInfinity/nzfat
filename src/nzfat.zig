@@ -213,18 +213,17 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         .fat12 => switch (c) {
                             0xFF7 => .defective,
                             0xFF8...0xFFF => .end_of_file,
-                            // NOTE: Never emit reserved clusters ourselves
-                            else => unreachable,
+                            else => .reserved,
                         },
                         .fat16 => switch (c) {
                             0xFFF7 => .defective,
                             0xFFF8...0xFFFF => .end_of_file,
-                            else => unreachable,
+                            else => .reserved,
                         },
                         .fat32 => switch (c) {
                             0xFFFFFF7 => .defective,
                             0xFFFFFF8...0xFFFFFFF => .end_of_file,
-                            else => unreachable,
+                            else => .reserved,
                         },
                     },
                 };
@@ -591,7 +590,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                             last_cluster = next_cluster;
                         }
 
-                        _ = try fat_ctx.writeFatEntry(blk, last_cluster, TableEntry.fromClusterIndex(allocated_clusters, fat_ctx.max_cluster, fat_ctx.getType()));
+                        _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = allocated_clusters });
                     } else {
                         try file.updateFileInfo(blk, length, allocated_clusters);
                         file.cluster_offset = allocated_clusters;
@@ -711,7 +710,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
                     // This means we're not growing an empty file
                     if (file.entry.cluster != 0) {
-                        _ = try fat_ctx.writeFatEntry(blk, file.cluster_offset, TableEntry.fromClusterIndex(new_allocated, fat_ctx.max_cluster, fat_ctx.getType()));
+                        _ = try fat_ctx.writeFatEntry(blk, file.cluster_offset, .{ .allocated = new_allocated });
                     }
 
                     var currently_written_bytes: u32 = 0;
@@ -1191,7 +1190,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 }
 
                 const newly_allocated_cluster = try fat_ctx.allocateDirectoryClusters(blk, 1);
-                _ = try fat_ctx.writeFatEntry(blk, last_cluster, TableEntry.fromClusterIndex(newly_allocated_cluster, fat_ctx.max_cluster, fat_ctx.getType()));
+                _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = newly_allocated_cluster });
 
                 free_sector = fat_ctx.cluster2Sector(newly_allocated_cluster);
                 // NOTE: The free entry will be at the start of the sector
@@ -1276,7 +1275,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     else => return e,
                 };
 
-                _ = try fat_ctx.writeFatEntry(blk, current_cluster, TableEntry.fromClusterIndex(next_free, fat_ctx.max_cluster, fat_ctx.getType()));
+                _ = try fat_ctx.writeFatEntry(blk, current_cluster, .{ .allocated = next_free });
                 current_cluster = next_free;
             }
 
