@@ -62,7 +62,7 @@ if(try fat_ctx.search(&blk, handle, name)) |entry| {
 - [x] Allocate clusters for files
 - [x] Creation of files and directories with short names
 - [x] API to modify dates and times and attributes in entries
-- [ ] API for reading and writing file contents
+- [x] API for reading and writing file contents
 - [ ] Searching for N free entries in a directory and creation of directory entries with LFN entries if needed.
 - [x] Create fat formatted media
 - [ ] Utility check and 'fix' fat filesystem
@@ -72,6 +72,7 @@ if(try fat_ctx.search(&blk, handle, name)) |entry| {
 
 ### Big TODO's
 - [x] Reorganize/rename things
+- [ ] Think about how to handle errors while writing (e.g: currently an error while allocating clusters will leave the FAT table with dangling clusters...)
 - [ ] Behaviour tests
 - [ ] Rewrite codepage name handling
 - [ ] Rewrite UCS-2 name handling
