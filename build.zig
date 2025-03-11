@@ -10,10 +10,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // This is a simple test app to open images
+    // This is a simple test app to open images and modify them
     const exe = b.addExecutable(.{
         .name = "nzfat",
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/testing_main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -40,15 +40,6 @@ pub fn build(b: *std.Build) void {
 
     const run_nzfat_unit_tests = b.addRunArtifact(nzfat_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
-
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_nzfat_unit_tests.step);
-    test_step.dependOn(&run_exe_unit_tests.step);
 }

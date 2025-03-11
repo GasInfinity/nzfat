@@ -95,7 +95,7 @@ pub fn main() !void {
     try floppy_file.setEndPos(2880 * 512);
 
     var floppy_blk_ctx = FileBlockContext{ .allocator = alloc, .fd = floppy_file, .logical_block_size = 512 };
-    try nzfat.format.make(&floppy_blk_ctx, .{ .volume_id = std.mem.zeroes([4]u8) });
+    // _ = try nzfat.format.make(&floppy_blk_ctx, .{ .volume_id = std.mem.zeroes([4]u8) });
 
     var fat_ctx = Fat.mount(&floppy_blk_ctx) catch |err| switch (err) {
         nzfat.MountError.InvalidBackupSector, nzfat.MountError.InvalidBootSignature, nzfat.MountError.InvalidBytesPerSector, nzfat.MountError.InvalidFatSize, nzfat.MountError.InvalidJump, nzfat.MountError.InvalidMediaType, nzfat.MountError.InvalidReservedSectorCount, nzfat.MountError.InvalidRootEntries, nzfat.MountError.InvalidSectorCount, nzfat.MountError.InvalidSectorsPerCluster, nzfat.MountError.UnsupportedFat => {
@@ -203,23 +203,35 @@ pub fn main() !void {
                 },
                 .mkdir => {
                     const next_path = command_args;
-                    if (try fat_ctx.searchShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path) == null) {
-                        _ = try fat_ctx.createShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path, .{ .type = .{ .directory = 2 } });
+
+                    const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
+                    defer alloc.free(utf16_next_path);
+
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path) == null) {
+                        _ = try fat_ctx.create(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path, .{ .type = .{ .directory = 2 } });
                     } else {
                         try stdout.print("File or directory already exists!\n", .{});
                     }
                 },
                 .touch => {
                     const next_path = command_args;
-                    if (try fat_ctx.searchShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path) == null) {
-                        _ = try fat_ctx.createShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path, .{ .type = .{ .file = 0 } });
+
+                    const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
+                    defer alloc.free(utf16_next_path);
+
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path) == null) {
+                        _ = try fat_ctx.create(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path, .{ .type = .{ .file = 0 } });
                     } else {
                         try stdout.print("File or directory already exists!\n", .{});
                     }
                 },
                 .write => {
                     const next_path = command_args;
-                    if (try fat_ctx.searchShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path)) |found| {
+
+                    const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
+                    defer alloc.free(utf16_next_path);
+
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
                         if (found.type != .file) {
                             try stdout.print("Cannot write to a directory!\n", .{});
                             continue;
@@ -233,7 +245,11 @@ pub fn main() !void {
                 },
                 .append => {
                     const next_path = command_args;
-                    if (try fat_ctx.searchShort(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], next_path)) |found| {
+
+                    const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
+                    defer alloc.free(utf16_next_path);
+
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
                         if (found.type != .file) {
                             try stdout.print("Cannot append to a directory!\n", .{});
                             continue;

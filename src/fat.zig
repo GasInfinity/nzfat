@@ -40,6 +40,10 @@ pub fn SuggestCluster(comptime maximum_supported_fat_type: Type) type {
     };
 }
 
+comptime {
+    std.debug.assert(@sizeOf(LongFileNameEntry) == @sizeOf(DirectoryEntry));
+}
+
 pub const BiosParameterBlock = extern struct {
     jmp: [3]u8 align(1),
     oem_identifier: [8]u8 align(1),
@@ -97,6 +101,8 @@ pub const FSInfo32 = extern struct {
 };
 
 pub const Attributes = packed struct(u8) {
+    pub const long_name = Attributes{ .read_only = true, .hidden = true, .system = true, .volume_id = true };
+
     read_only: bool = false,
     hidden: bool = false,
     system: bool = false,
@@ -107,15 +113,6 @@ pub const Attributes = packed struct(u8) {
 
     pub fn isLongName(attributes: Attributes) bool {
         return attributes.read_only and attributes.hidden and attributes.hidden and attributes.volume_id;
-    }
-
-    pub fn longName() Attributes {
-        return Attributes{
-            .read_only = true,
-            .hidden = true,
-            .system = true,
-            .volume_id = true,
-        };
     }
 };
 
@@ -140,22 +137,12 @@ pub const DirectoryEntry = extern struct {
     first_cluster_lo: u16 align(1),
     file_size: u32 align(1),
 
-    pub fn checksum(entry: DirectoryEntry) u8 {
-        var sum: u8 = 0;
-
-        inline for (0..entry.name.len) |i| {
-            sum = std.math.rotr(u8, sum, 1) +% entry.name[i];
-        }
-
-        return sum;
-    }
-
     pub fn isFirstEmptyEntry(entry: DirectoryEntry) bool {
         return entry.name[0] == 0x00;
     }
 
     pub fn isDeleted(entry: DirectoryEntry) bool {
-        return entry.name[0] == 0xE5;
+        return entry.name[0] == deletion_flag;
     }
 
     pub fn isFree(entry: DirectoryEntry) bool {
@@ -164,23 +151,93 @@ pub const DirectoryEntry = extern struct {
 };
 
 pub const LongFileNameEntry = extern struct {
+    const name1_len = 5;
+    const name2_len = 6;
+    const name3_len = 2;
+
+    pub const last_entry_mask: u8 = 0x40;
+    pub const stored_name_length = name1_len + name2_len + name3_len;
+
     order: u8 align(1),
-    name1: [5]u16 align(1),
-    attributes: Attributes align(1),
+    name1: [name1_len]u16 align(1),
+    attributes: Attributes align(1) = Attributes.long_name,
     type: u8 align(1) = 0,
     checksum: u8 align(1),
-    name2: [6]u16 align(1),
-    first_cluster_lo: u16 align(1),
-    name3: [2]u16 align(1),
+    name2: [name2_len]u16 align(1),
+    first_cluster_lo: u16 align(1) = 0,
+    name3: [name3_len]u16 align(1),
 
-    pub const stored_name_length = 13;
-    pub const last_entry_mask: u8 = 0x40;
+    pub fn init(order: u8, checksum: u8, utf16: []const u16) LongFileNameEntry {
+        return LongFileNameEntry{
+            .order = order,
+            .checksum = checksum,
+            .name1 = utf16[0..name1_len].*,
+            .name2 = utf16[name1_len..][0..name2_len].*,
+            .name3 = utf16[(name1_len + name2_len)..][0..name3_len].*,
+        };
+    }
+
+    pub fn initLast(order: u8, checksum: u8, utf16: []const u16) LongFileNameEntry {
+        if (utf16.len == stored_name_length) {
+            return init(order, checksum, utf16);
+        }
+
+        const name1, const name2, const name3 = names: {
+            if (utf16.len > name1_len + name2_len) {
+                break :names .{ utf16[0..name1_len].*, utf16[name1_len..][0..name2_len].*, [_]u16{ utf16[name1_len + name2_len], 0x0000 } };
+            }
+
+            if (utf16.len > name1_len) {
+                const utf16_next = utf16[name1_len..];
+
+                const name2, const name3 = if (utf16_next.len == name2_len)
+                    .{ utf16_next[0..name2_len].*, [_]u16{ 0x0000, 0xFFFF } }
+                else v: {
+                    var name2: [name2_len]u16 = undefined;
+                    @memcpy(name2[0..utf16_next.len], utf16_next);
+                    name2[utf16_next.len] = 0x0000;
+
+                    if ((utf16_next.len + 1) < name2_len) {
+                        @memset(name2[(utf16_next.len + 1)..], 0xFFFF);
+                    }
+
+                    break :v .{ name2, [_]u16{ 0xFFFF, 0xFFFF } };
+                };
+
+                break :names .{ utf16[0..name1_len].*, name2, name3 };
+            }
+
+            const name1, const name2 = if (utf16.len == name1_len)
+                .{ utf16[0..name1_len].*, ([_]u16{0x0000} ++ [_]u16{0xFFFF} ** (name2_len - 1)) }
+            else v: {
+                var name1: [name1_len]u16 = undefined;
+                @memcpy(name1[0..utf16.len], utf16);
+                name1[utf16.len] = 0x0000;
+
+                if ((utf16.len + 1) < name1_len) {
+                    @memset(name1[(utf16.len + 1)..], 0xFFFF);
+                }
+
+                break :v .{ name1, [_]u16{0xFFFF} ** name2_len };
+            };
+
+            break :names .{ name1, name2, [_]u16{0xFFFF} ** name3_len };
+        };
+
+        return LongFileNameEntry{
+            .order = order,
+            .checksum = checksum,
+            .name1 = name1,
+            .name2 = name2,
+            .name3 = name3,
+        };
+    }
 
     pub fn isLast(lfn: LongFileNameEntry) bool {
         return (lfn.order & last_entry_mask) != 0;
     }
 
-    pub fn appendEntryNamesReverse(lfn: *const LongFileNameEntry, buf: []u16, current_end: *usize) void {
+    pub fn appendEntryNameReverse(lfn: LongFileNameEntry, buf: []u16, current_end: *usize) void {
         @memcpy(buf[(current_end.* - lfn.name3.len)..current_end.*], &lfn.name3);
         current_end.* -= lfn.name3.len;
 
@@ -191,7 +248,7 @@ pub const LongFileNameEntry = extern struct {
         current_end.* -= lfn.name1.len;
     }
 
-    pub fn appendLastEntryNamesReverse(lfn: *const LongFileNameEntry, buf: []u16, current_end: *usize) void {
+    pub fn appendLastEntryNameReverse(lfn: LongFileNameEntry, buf: []u16, current_end: *usize) void {
         var tmp: [6]u16 = undefined;
 
         @memcpy(tmp[0..lfn.name3.len], &lfn.name3);

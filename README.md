@@ -6,47 +6,10 @@ Almost all the features are configurable, from long filename support (and the ma
 
   
 ## ❓ Usage
-The library is not mature enough for production usage, but if you still want to use this, here's some little info:
+The library is not mature enough for production usage.
   
-The `FatFilesystem` type only needs two arguments, the block device context and its configuration. Some methods change their signature depending on the configuration and all methods require the block context to be passed to it. This library never stores the passed block device anywhere.
-
-For example, mounting a FAT filesystem might be done like this:
-```zig
-const nzfat = @import("nzfat");
-const Fat = nzfat.FatFilesystem(...);
-// ...
-var fat_ctx = try Fat.mount(&blk);
-// See zfat.MountError
-```
-
-To traverse the directory entries you have `directoryEntryIterator` at your disposal:
-```zig
-// TODO: Explain why directoryIteratorContext is sometimes needed for long filenames.
-var dir_it = fat_ctx.directoryEntryIterator(null); // NOTE: null is the root directory
-defer dir_it.deinit();
-
-std.debug.print("- Listing entries at /\n");
-while (try dir_it.next(&blk)) |it_entry| : (entries += 1) {
-    // Do something with it_entry
-    std.debug.print("- {s}", .{it_entry.sfn});
-
-    // NOTE: Only if enabled in the config, if not it_entry.lfn will be void!
-    if(it_entry.lfn) |lfn| {
-        std.debug.print(" ({s})", utf16ToUtf8(lfn));
-    }
-
-    std.debug.print("\n", .{});
-}
-```
-
-As searching for a specific entry in a directory is very common, `search`, `searchContext` and `searchShort` abstract away the case-insensitive nature of the filesystem:
-```zig
-// TODO: Explain that for long filenames a case-insensitive comparison function must be provided as its out of scope for this project
-if(try fat_ctx.search(&blk, handle, name)) |entry| {
-    std.debug.print("'{s}' found! Is a {}", .{utf8_name, @tagName(entry.type)});
-    // Do something with the entry we found...
-}
-```
+Almost everything revolves around the type `nzfat.FatFileSystem` and the function `nzfat.format.make()`.
+Please see [a basic example](examples/basic.zig) or [messy testing code that uses all its features](src/testing_main.zig)
 
 ## 📝 TODO
 
@@ -63,10 +26,14 @@ if(try fat_ctx.search(&blk, handle, name)) |entry| {
 - [x] Creation of files and directories with short names
 - [x] API to modify dates and times and attributes in entries
 - [x] API for reading and writing file contents
-- [ ] Searching for N free entries in a directory and creation of directory entries with LFN entries if needed.
+- [x] Searching for N free entries in a directory and creation of directory entries with LFN entries if needed.
+- [ ] Finish cross-section long filename directory creation
+- [ ] API for moving files without copying
 - [x] Create fat formatted media
+- [ ] Finish FAT32 formatting
+- [ ] Proper FAT unmounting
 - [ ] Utility check and 'fix' fat filesystem
-- [ ] Utility to write files given a buffer (a.k.a: writeAllBytes)
+- [x] Utility to write files given a buffer (a.k.a: writeAllBytes)
 - [ ] Comptime utility function to create directories and files given a comptime known path (Really useful!)
 - [ ] Comptime utility function to search for directories and files given a comptime known path (Really useful!)
 
@@ -75,7 +42,7 @@ if(try fat_ctx.search(&blk, handle, name)) |entry| {
 - [ ] Think about how to handle errors while writing (e.g: currently an error while allocating clusters will leave the FAT table with dangling clusters...)
 - [ ] Behaviour tests
 - [ ] Rewrite codepage name handling
-- [ ] Rewrite UCS-2 name handling
+- [ ] Rewrite UTF-16 name handling
 
 - [ ] Implement some sort of I/O cache? Or leave it to the BlockDevice implementation?
 - [ ] Some sort of cache strategy for FAT entries if requested.

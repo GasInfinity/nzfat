@@ -7,6 +7,8 @@ const ExtendedBootRecord32 = fat.ExtendedBootRecord32;
 const FSInfo32 = fat.FSInfo32;
 const DiskDirectoryEntry = fat.DirectoryEntry;
 
+const log = std.log.scoped(.nzfat_format);
+
 pub const Type = fat.Type;
 
 pub const Config = struct {
@@ -32,7 +34,7 @@ pub const Error = error{
     IncompatibleDevice,
 };
 
-pub fn make(blk: anytype, config: Config) !void {
+pub fn make(blk: anytype, config: Config) !FatParameters {
     const bytes_per_sector: u16 = @intCast(if (config.bytes_per_sector) |bytes_per_sector| v: {
         std.debug.assert(bytes_per_sector >= 512 and bytes_per_sector <= 4096 and std.math.isPowerOfTwo(bytes_per_sector));
         try blk.setLogicalBlockSize(bytes_per_sector);
@@ -47,9 +49,7 @@ pub fn make(blk: anytype, config: Config) !void {
     }
 
     const fat_blk_size: u32 = @intCast(blk_size);
-
     const fat_parameters = try getFatParameters(fat_blk_size, bytes_per_sector, config);
-    std.debug.print("{} -- {} -- {}\n", .{ bytes_per_sector, fat_blk_size, fat_parameters });
 
     const boot_sector = try blk.map(0);
     defer blk.unmap(0, boot_sector);
@@ -180,10 +180,36 @@ pub fn make(blk: anytype, config: Config) !void {
     }
 
     try blk.commit(0, boot_sector);
+    return fat_parameters;
 }
 
-// FIXME: Simplify this!
+pub const FatParameters = struct {
+    fat_type: Type,
+    fats: u8,
+    reserved_sectors: u16,
+    media_type: u8,
+    heads: u8,
+    sectors_per_track: u8,
+    root_directory_entries: u16,
+    sectors_per_cluster: u8,
+    fat_size: u32,
 
+    pub inline fn init(fat_type: Type, fats: u8, reserved_sectors: u16, media_type: u8, heads: u8, sectors_per_track: u8, root_directory_entries: u16, sectors_per_cluster: u8, fat_size: u32) FatParameters {
+        return FatParameters{
+            .fat_type = fat_type,
+            .fats = fats,
+            .reserved_sectors = reserved_sectors,
+            .media_type = media_type,
+            .heads = heads,
+            .sectors_per_track = sectors_per_track,
+            .root_directory_entries = root_directory_entries,
+            .sectors_per_cluster = sectors_per_cluster,
+            .fat_size = fat_size,
+        };
+    }
+};
+
+// FIXME: Simplify this!
 fn getFatParameters(blk_size: u32, bytes_per_sector: u16, config: Config) !FatParameters {
     const suggested_floppy_parameters = suggestFloppyParameters(blk_size, bytes_per_sector);
 
@@ -215,6 +241,12 @@ fn getFatParameters(blk_size: u32, bytes_per_sector: u16, config: Config) !FatPa
             }
 
             return Error.InvalidSectorsPerCluster;
+        }
+
+        if (suggested_floppy_parameters) |floppy_parameters| {
+            if (f_t == floppy_parameters.fat_type) {
+                break :v .{ f_t, floppy_parameters.sectors_per_cluster, floppy_parameters.fat_size };
+            }
         }
 
         if (suggestSectorsPerCluster(f_t, fats, usable_sectors, bytes_per_sector_shift, 0)) |suggestion| {
@@ -313,32 +345,6 @@ fn suggestFloppyParameters(blk_size: anytype, bytes_per_sector: u16) ?FatParamet
         }
     } else null;
 }
-
-const FatParameters = struct {
-    fat_type: Type,
-    fats: u8,
-    reserved_sectors: u16,
-    media_type: u8,
-    heads: u8,
-    sectors_per_track: u8,
-    root_directory_entries: u16,
-    sectors_per_cluster: u8,
-    fat_size: u32,
-
-    pub inline fn init(fat_type: Type, fats: u8, reserved_sectors: u16, media_type: u8, heads: u8, sectors_per_track: u8, root_directory_entries: u16, sectors_per_cluster: u8, fat_size: u32) FatParameters {
-        return FatParameters{
-            .fat_type = fat_type,
-            .fats = fats,
-            .reserved_sectors = reserved_sectors,
-            .media_type = media_type,
-            .heads = heads,
-            .sectors_per_track = sectors_per_track,
-            .root_directory_entries = root_directory_entries,
-            .sectors_per_cluster = sectors_per_cluster,
-            .fat_size = fat_size,
-        };
-    }
-};
 
 const FloppyFatParameters = struct {
     bytes_per_sector: u16,
