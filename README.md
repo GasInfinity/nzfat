@@ -14,8 +14,6 @@ Please see [a basic example](examples/basic.zig) or [messy testing code that use
 ## 📝 TODO
 
 ### Small TODO's
-- [ ] Update to zig 0.14.0
-
 - [x] Searching for 1 free entry in a directory (a.k.a: Short filename only)
 - [x] Searching for a free cluster linearly
 - [x] Deletion of files and directories
