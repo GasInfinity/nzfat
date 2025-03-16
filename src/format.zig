@@ -9,6 +9,15 @@ const DiskDirectoryEntry = fat.DirectoryEntry;
 
 const log = std.log.scoped(.nzfat_format);
 
+const bootsector_origin = 0x7C00;
+
+const default_boot_code = @embedFile("assets/unbootable.bin");
+const default_boot_code_patched_message_address = std.mem.indexOf(u8, default_boot_code, "\xBE\xBA").?;
+const default_boot_code_patched_message_len = std.mem.indexOf(u8, default_boot_code, "\xFE\xCA").?;
+
+// TODO: Make this configurable?
+const default_boot_code_message = "Oops! Trying to boot an unbootable FAT drive.";
+
 pub const Type = fat.Type;
 
 pub const Config = struct {
@@ -123,7 +132,13 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
 
             @memcpy(ebr32.boot_code[0..boot_code.len], boot_code);
             @memset(ebr32.boot_code[boot_code.len..], 0x00);
-        } else @memset(&ebr32.boot_code, 0x00); // TODO: Write a simple x86 bootsector to display: Oops! Trying to boot a non-bootable FATXX drive
+        } else {
+            @memcpy(ebr32.boot_code[0..default_boot_code.len], default_boot_code);
+            @memcpy(ebr32.boot_code[default_boot_code.len..][0..default_boot_code_message.len], default_boot_code_message);
+            std.mem.writeInt(u16, ebr32.boot_code[default_boot_code_patched_message_address..][0..2], bootsector_origin + @sizeOf(fat.BiosParameterBlock) + @offsetOf(ExtendedBootRecord32, "boot_code") + default_boot_code.len, .little);
+            std.mem.writeInt(u16, ebr32.boot_code[default_boot_code_patched_message_len..][0..2], default_boot_code_message.len, .little);
+            @memset(ebr32.boot_code[(default_boot_code.len + default_boot_code_message.len)..], 0x00);
+        }
 
         const fsinfo_sector = try blk.map(1);
         defer blk.unmap(1, fsinfo_sector);
@@ -131,7 +146,8 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
         const fsinfo_slice = fsinfo_sector.asSlice();
         const fsinfo32: *align(1) FSInfo32 = std.mem.bytesAsValue(FSInfo32, fsinfo_slice);
 
-        const cluster_count = (fat_blk_size - fat_parameters.reserved_sectors - fat_parameters.fat_size * fat_parameters.fats) / fat_parameters.sectors_per_cluster;
+        const data_offset = fat_parameters.reserved_sectors - fat_parameters.fat_size * fat_parameters.fats;
+        const cluster_count = (fat_blk_size - data_offset) / fat_parameters.sectors_per_cluster;
 
         fsinfo32.* = FSInfo32{
             .last_known_free_cluster_count = cluster_count - 1,
@@ -139,8 +155,22 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
         };
 
         try blk.commit(1, fsinfo_sector);
-        // TODO: Copy the boot record and fsinfo ot the backup sectors!
-        // TODO: Create root directory
+        // TODO: Copy the boot record, fsinfo and first reserved sector into the backup sectors!
+
+        const directory_entries_per_sector = bytes_per_sector / @sizeOf(fat.DirectoryEntry);
+
+        for (0..fat_parameters.sectors_per_cluster) |cluster_sector| {
+            const root_directory_sector = try blk.map(data_offset + cluster_sector);
+            defer blk.unmap(data_offset, root_directory_sector);
+
+            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, root_directory_sector.asSlice());
+
+            for (0..directory_entries_per_sector) |entry| {
+                directory_entries[entry].name[0] = 0x00;
+            }
+
+            try blk.commit(data_offset, root_directory_sector);
+        }
     } else {
         bpb.jmp = [3]u8{ 0xEB, 0x3C, 0x90 };
         bpb.sectors_per_fat = @intCast(fat_parameters.fat_size);
@@ -163,7 +193,13 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
 
             @memcpy(ebr.boot_code[0..boot_code.len], boot_code);
             @memset(ebr.boot_code[boot_code.len..], 0x00);
-        } else @memset(&ebr.boot_code, 0x00); // Same as above
+        } else {
+            @memcpy(ebr.boot_code[0..default_boot_code.len], default_boot_code);
+            @memcpy(ebr.boot_code[default_boot_code.len..][0..default_boot_code_message.len], default_boot_code_message);
+            std.mem.writeInt(u16, ebr.boot_code[default_boot_code_patched_message_address..][0..2], bootsector_origin + @sizeOf(fat.BiosParameterBlock) + @offsetOf(ExtendedBootRecord, "boot_code") + default_boot_code.len, .little);
+            std.mem.writeInt(u16, ebr.boot_code[default_boot_code_patched_message_len..][0..2], default_boot_code_message.len, .little);
+            @memset(ebr.boot_code[(default_boot_code.len + default_boot_code_message.len)..], 0x00);
+        }
 
         const root_entries_sectors = ((fat_parameters.root_directory_entries * @sizeOf(DiskDirectoryEntry)) + (bytes_per_sector - 1)) / bytes_per_sector;
         const root_entries_start = fat_parameters.reserved_sectors + (fat_parameters.fats * fat_parameters.fat_size);
@@ -180,6 +216,8 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
     }
 
     try blk.commit(0, boot_sector);
+
+    // TODO: Write the 0th and 1st FAT entries to leave the disk in a "clean" state
     return fat_parameters;
 }
 

@@ -25,11 +25,13 @@ Please see [a basic example](examples/basic.zig) or [messy testing code that use
 - [x] API to modify dates and times and attributes in entries
 - [x] API for reading and writing file contents
 - [x] Searching for N free entries in a directory and creation of directory entries with LFN entries if needed.
-- [ ] Finish cross-section long filename directory creation
-- [ ] API for moving files without copying
+- [x] Finish cross-section long filename directory creation
+- [x] Support Windows NT extra reserved short filename case flags
 - [x] Create fat formatted media
 - [ ] Finish FAT32 formatting
 - [ ] Proper FAT unmounting
+- [ ] API for renaming files without copying
+- [ ] API for moving files without copying
 - [ ] Utility check and 'fix' fat filesystem
 - [x] Utility to write files given a buffer (a.k.a: writeAllBytes)
 - [ ] Comptime utility function to create directories and files given a comptime known path (Really useful!)
@@ -37,10 +39,10 @@ Please see [a basic example](examples/basic.zig) or [messy testing code that use
 
 ### Big TODO's
 - [x] Reorganize/rename things
+- [x] Rewrite codepage name handling
+- [x] Rewrite UTF-16 name handling
 - [ ] Think about how to handle errors while writing (e.g: currently an error while allocating clusters will leave the FAT table with dangling clusters...)
 - [ ] Behaviour tests
-- [ ] Rewrite codepage name handling
-- [ ] Rewrite UTF-16 name handling
 
 - [ ] Implement some sort of I/O cache? Or leave it to the BlockDevice implementation?
 - [ ] Some sort of cache strategy for FAT entries if requested.

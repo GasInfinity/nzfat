@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub const fat = @import("fat.zig");
-pub const sfn = @import("sfn.zig");
 pub const format = @import("format.zig");
 
 const BiosParameterBlock = fat.BiosParameterBlock;
@@ -15,6 +14,7 @@ const LongFileNameEntry = fat.LongFileNameEntry;
 pub const Time = fat.Time;
 pub const Date = fat.Date;
 pub const Type = fat.Type;
+pub const ShortFilenameDisplay = fat.sfn.Display;
 
 // TODO: Maybe reorganize this
 
@@ -45,69 +45,53 @@ pub const MountError = error{
     UnsupportedFat,
 };
 
-pub const LongConversionResult = struct { len: u8, lossy: bool };
-
-// TODO: Refactor/think about this
-pub const DefaultLongContext = struct {
-    pub fn codepageToUtf16Le(_: DefaultLongContext, utf16: *[sfn.len + 1]u16, codepage: []const u8) void {
-        for (0..codepage.len) |i| {
-            utf16[i] = std.mem.nativeToLittle(u16, codepage[i]);
-        }
-    }
-
-    pub fn utf16LeToCodepage(_: DefaultLongContext, codepage: *[sfn.len + 1]u8, utf16: []const u16) LongConversionResult {
-        const trimmed = std.mem.trim(u16, utf16, std.unicode.utf8ToUtf16LeStringLiteral(" "));
-        const last_possible_dot = std.mem.lastIndexOf(u16, trimmed, std.unicode.utf8ToUtf16LeStringLiteral("."));
+// TODO: Think even more about this
+pub const AsciiOnlyLongContext = struct {
+    pub fn utf16LeToCodepage(_: AsciiOnlyLongContext, filename: *ShortFilenameDisplay, utf16: []const u16) bool {
+        const last_possible_dot = std.mem.lastIndexOf(u16, utf16, std.unicode.utf8ToUtf16LeStringLiteral("."));
+        const base, const extension = if (last_possible_dot) |last_dot|
+            .{ utf16[0..last_dot], utf16[(last_dot + 1)..] }
+        else
+            .{ utf16, &[_]u16{} };
 
         var lossy = false;
-        var current: u8 = 0;
-        if (last_possible_dot) |last_dot| {
-            const base = trimmed[0..last_dot];
-            const extension = trimmed[(last_dot + 1)..];
 
-            const copied_base = if (base.len > sfn.extension_len) v: {
+        const copied_base = if (base.len > fat.sfn.max_base_len) v: {
+            lossy = true;
+            break :v base[0..fat.sfn.max_base_len];
+        } else base;
+
+        const copied_extension = if (extension.len > fat.sfn.max_extension_len) v: {
+            lossy = true;
+            break :v extension[0..fat.sfn.max_extension_len];
+        } else extension;
+
+        for (copied_base) |c| {
+            if (c > 127) {
                 lossy = true;
-                break :v base[0..sfn.base_len];
-            } else base;
-
-            const copied_extension = if (extension.len > sfn.extension_len) v: {
-                lossy = true;
-                break :v extension[0..sfn.extension_len];
-            } else extension;
-
-            for (copied_base) |c| {
-                codepage[current] = @truncate(c);
-                current += 1;
+                continue;
             }
 
-            codepage[current] = '.';
-            current += 1;
+            filename.appendAssumeCapacity(@intCast(c));
+        }
+
+        if (copied_extension.len > 0) {
+            filename.appendAssumeCapacity('.');
 
             for (copied_extension) |c| {
-                codepage[current] = @truncate(c);
-                current += 1;
-            }
-        } else {
-            const base = trimmed;
+                if (c > 127) {
+                    lossy = true;
+                    continue;
+                }
 
-            const copied_base = if (base.len > sfn.extension_len) v: {
-                lossy = true;
-                break :v base[0..sfn.base_len];
-            } else base;
-
-            for (copied_base) |c| {
-                codepage[current] = @truncate(c);
-                current += 1;
+                filename.appendAssumeCapacity(@intCast(c));
             }
         }
 
-        return LongConversionResult{
-            .len = current,
-            .lossy = false,
-        };
+        return lossy;
     }
 
-    pub fn eql(_: DefaultLongContext, left: []const u16, right: []const u16) bool {
+    pub fn eql(_: AsciiOnlyLongContext, left: []const u16, right: []const u16) bool {
         if (left.len != right.len) return false;
         for (left, 0..) |left_c, i| {
             const right_c = right[i];
@@ -136,11 +120,14 @@ pub const Config = struct {
         maximum_supported_len: u8 = 255,
         /// The context used to convert between short filenames to long and viceversa. Also needed for UCS-2 case-insensitive comparison.
         /// The default context does compares strings as ASCII ignoring case and converts UCS-2 to ASCII when converting to the drive codepage.
-        context: type = DefaultLongContext,
+        context: type = AsciiOnlyLongContext,
     };
 
     /// The maximum supported FAT of the FatFilesystem, affects code size.
     maximum_supported_type: Type = .fat32,
+
+    /// The context for the stored FAT codepage
+    codepage_context: type = fat.AsciiCodepageContext,
 
     /// Whether the FatFilesystem supports the VFAT extension for long filenames, affects code size greatly.
     long_filenames: ?LongFilenameConfig = LongFilenameConfig{},
@@ -180,10 +167,11 @@ pub const CreationInfo = struct {
     creation_time: Time = std.mem.zeroes(Time),
     creation_date: Date = std.mem.zeroes(Date),
 
-    pub inline fn asDiskDirectoryEntry(info: CreationInfo, name: [sfn.len]u8, cluster: anytype, file_size: u32) DiskDirectoryEntry {
+    pub inline fn asDiskDirectoryEntry(info: CreationInfo, name: [fat.sfn.stored_len]u8, nt_flags: fat.ExtraAttributes, cluster: anytype, file_size: u32) DiskDirectoryEntry {
         return DiskDirectoryEntry{
             .name = name,
             .attributes = info.attributes.toDiskAttributes(info.type == .directory),
+            .reserved = nt_flags,
             .creation_time_tenth = info.creation_time_tenth,
             .creation_time = info.creation_time,
             .creation_date = info.creation_date,
@@ -235,8 +223,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         pub const EntryName = if (config.long_filenames) |_| []const u16 else []const u8;
 
         // +1 for dot
-        const LongCodepageConversionBuffer = if (config.long_filenames) |_| [sfn.len + 1:0]u8 else void;
-        const LongSfnConversionBuffer = if (config.long_filenames) |_| [sfn.len:0]u8 else void;
+        const LongCodepageConversionBuffer = if (config.long_filenames) |_| [fat.sfn.max_len:0]u8 else void;
+        const LongSfnConversionBuffer = if (config.long_filenames) |_| [fat.sfn.stored_len:0]u8 else void;
         const LongContext = if (config.long_filenames) |long_config| long_config.context else void;
 
         const max_long_filename_entries = if (config.long_filenames) |long_config| ((@as(usize, long_config.maximum_supported_len) + LongFileNameEntry.stored_name_length - 1) / LongFileNameEntry.stored_name_length) else 0;
@@ -856,22 +844,22 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 var it = fat_ctx.directoryEntryIterator(directory);
                 defer it.deinit(blk);
 
+                var codepage_filename = ShortFilenameDisplay.init(0) catch unreachable;
+                const codepage_conversion_lossy = ctx.utf16LeToCodepage(&codepage_filename, name);
+                const codepage_name = codepage_filename.constSlice();
+                const stored = fat.sfn.store(codepage_name, fat.AsciiCodepageContext{});
+
                 while (try it.next(blk)) |it_entry| {
                     if (it_entry.lfn) |lfn| {
                         if (ctx.eql(lfn, name)) {
                             return it_entry.entry;
                         }
                     } else {
-                        if (name.len > sfn.len + 1) {
+                        if (codepage_conversion_lossy or !std.mem.eql(u8, it_entry.sfn, &stored.result)) {
                             continue;
                         }
 
-                        var sfn_buf: [sfn.len + 1]u16 = undefined;
-                        ctx.codepageToUtf16Le(&sfn_buf, it_entry.sfn);
-
-                        if (ctx.eql(sfn_buf[0..name.len], name)) {
-                            return it_entry.entry;
-                        }
+                        return it_entry.entry;
                     }
                 }
 
@@ -880,11 +868,18 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         }
 
         pub fn searchShort(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8) BlockMapOrClusterTraversalError!?DirectoryEntry {
+            const stored = fat.sfn.store(name, fat.AsciiCodepageContext{});
+
+            if (stored.lossy) {
+                // HACK: Return error?
+                return null;
+            }
+
             var it = fat_ctx.directoryEntryIterator(directory);
             defer it.deinit(blk);
 
             while (try it.next(blk)) |it_entry| {
-                if (std.ascii.eqlIgnoreCase(it_entry.sfn, name)) {
+                if (std.mem.eql(it_entry.sfn, stored.result)) {
                     return it_entry.entry;
                 }
             }
@@ -902,16 +897,22 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         const DirectoryEntryIterator = struct {
             const LongEntryName = if (config.long_filenames) |_| ?[:0]const u16 else void;
             const LongEntryNameBuffer = if (config.long_filenames) |_| [config.long_filenames.?.maximum_supported_len:0]u16 else void;
+            const ShortFilenameCasing = fat.ExtraAttributes;
 
             pub const Entry = struct {
-                sfn: []const u8,
+                sfn: *const [fat.sfn.stored_len:0]u8,
                 lfn: LongEntryName,
                 entry: DirectoryEntry,
+                _casing: ShortFilenameCasing,
+
+                pub inline fn displayShortFilename(entry: Entry, filename: *ShortFilenameDisplay) void {
+                    fat.sfn.display(filename, entry.sfn.*, entry._casing.lower_base, entry._casing.lower_extension, fat.AsciiCodepageContext{});
+                }
             };
 
             it: DiskDirectoryEntryIterator,
             current_location: DirectoryEntrySectorLocation = undefined,
-            sfn: [sfn.len + 1:0]u8 = undefined,
+            sfn: [fat.sfn.stored_len:0]u8 = undefined,
             lfn: LongEntryNameBuffer = undefined,
 
             pub inline fn init(it: DiskDirectoryEntryIterator) DirectoryEntryIterator {
@@ -1008,7 +1009,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                                     continue :retry_entry;
                                 }
 
-                                const real_entry_checksum = sfn.checksum(real_entry.name);
+                                const real_entry_checksum = fat.sfn.checksum(real_entry.name);
 
                                 if (checksum != real_entry_checksum) {
                                     current_entry = real_entry;
@@ -1038,21 +1039,12 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             }
 
             inline fn unpackDirectoryEntry(it: *DirectoryEntryIterator, entry: DiskDirectoryEntry, lfn: LongEntryName) Entry {
-                const written: usize = sfn.shortFilenameToT(u8, &it.sfn, entry.name);
-
-                if (written < it.sfn.len) {
-                    it.sfn[written] = 0;
-                }
-
                 if (max_file_entries > 1) {
                     it.current_location.sector_entry_end = it.it.lastSectorEntry();
                 }
 
-                return Entry{
-                    .sfn = it.sfn[0..written :0],
-                    .lfn = lfn,
-                    .entry = DirectoryEntry.fromDiskEntry(entry, it.current_location),
-                };
+                @memcpy(&it.sfn, &entry.name);
+                return Entry{ .sfn = &it.sfn, .lfn = lfn, .entry = DirectoryEntry.fromDiskEntry(entry, it.current_location), ._casing = entry.reserved };
             }
 
             pub fn deinit(it: *DirectoryEntryIterator, blk: *BlockDevice) void {
@@ -1085,7 +1077,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             return true;
         }
 
-        inline fn expectDiskDirectoryEntry(it: *DiskDirectoryEntryIterator, blk: *BlockDevice, comptime name: *const [sfn.len]u8) BlockMapOrClusterTraversalError!void {
+        fn expectDiskDirectoryEntry(it: *DiskDirectoryEntryIterator, blk: *BlockDevice, comptime name: *const [fat.sfn.stored_len]u8) BlockMapOrClusterTraversalError!void {
             if (try it.next(blk)) |dir| {
                 if (!std.mem.eql(u8, &dir.name, name)) {
                     return; // TODO: Error
@@ -1097,7 +1089,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             return; // TODO: Error
         }
 
-        inline fn deleteClusterChain(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) DeleteClustersError!void {
+        fn deleteClusterChain(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) DeleteClustersError!void {
             var current = start;
 
             while (try fat_ctx.writeNextAllocatedCluster(blk, current, .free)) |next| {
@@ -1105,7 +1097,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             }
         }
 
-        inline fn deleteDiskDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry) BlockMapOrCommitError!void {
+        fn deleteDiskDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry) BlockMapOrCommitError!void {
             const sector_stack = entry.location.getSectorStack();
 
             if (sector_stack.len == 1) {
@@ -1153,7 +1145,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             }
         }
 
-        inline fn deleteSectorDirectoryEntries(blk: *BlockDevice, sector_index: BlockSector, start: u8, end: u8) BlockMapOrCommitError!void {
+        fn deleteSectorDirectoryEntries(blk: *BlockDevice, sector_index: BlockSector, start: u8, end: u8) BlockMapOrCommitError!void {
             const sector = try blk.map(sector_index);
             defer blk.unmap(sector_index, sector);
 
@@ -1178,14 +1170,16 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     break :v dir.entry.cluster;
                 } else fat_ctx.getRootCluster();
 
-                var codepage_buf: [sfn.len + 1]u8 = undefined;
+                var codepage_filename = ShortFilenameDisplay.init(0) catch unreachable;
                 // TODO: Check duplicate short names and do something?
-                const codepage_conversion_result = ctx.utf16LeToCodepage(&codepage_buf, name);
-                const codepage_name = codepage_buf[0..codepage_conversion_result.len];
-                const sfn_conversion_result = sfn.codepageToShortFilename(codepage_name);
+                const codepage_conversion_lossy = ctx.utf16LeToCodepage(&codepage_filename, name);
+                const codepage_name = codepage_filename.constSlice();
 
-                const needs_lfn = codepage_conversion_result.lossy or sfn_conversion_result.lossy;
-                const needed_lfn_entries: u8 = if (needs_lfn) (@as(u8, @intCast(name.len)) + LongFileNameEntry.stored_name_length - 1) / LongFileNameEntry.stored_name_length else 0;
+                // TODO: Codepage context
+                const stored_sfn = fat.sfn.store(codepage_name, fat.AsciiCodepageContext{});
+
+                const needs_lfn = codepage_conversion_lossy or stored_sfn.lossy;
+                const needed_lfn_entries: u8 = if (needs_lfn) (1 + (@as(u8, @intCast(name.len)) / LongFileNameEntry.stored_name_length)) else 0;
                 const needed_entries = needed_lfn_entries + 1;
 
                 var entry_location: DirectoryEntrySectorLocation = std.mem.zeroes(DirectoryEntrySectorLocation);
@@ -1215,6 +1209,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                             entry_location.sector_stack_current += 1;
 
                             entry_location.sector_entry_start = dir_it.lastSectorEntry();
+                            entry_location.sector_entry_end = entry_location.sector_entry_start;
                         } else {
                             entry_location.sector_entry_end = dir_it.lastSectorEntry();
 
@@ -1256,7 +1251,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
 
                     if (start != end) {
-                        const checksum = sfn.checksum(sfn_conversion_result.sfn);
+                        const checksum = fat.sfn.checksum(stored_sfn.result);
 
                         var current_entry = end - 1;
                         var lfn_current_character: u8 = 0;
@@ -1271,20 +1266,86 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         }
 
                         const last_lfn_entry: *LongFileNameEntry = @ptrCast(&directory_entries[current_entry]);
-                        last_lfn_entry.* = LongFileNameEntry.initLast(needed_lfn_entries | LongFileNameEntry.last_entry_mask, checksum, name[lfn_current_character..]);
+                        last_lfn_entry.* = LongFileNameEntry.initLast(needed_lfn_entries, checksum, name[lfn_current_character..]);
                     }
 
-                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[end], sfn_conversion_result.sfn, entry_info);
+                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[end], stored_sfn, entry_info);
                     try blk.commit(sector_index, sector);
                     return DirectoryEntry.fromDiskEntry(directory_entries[end], entry_location);
                 } else {
-                    // TODO: Cross sector creation
-                    unreachable; // TODO
+                    const directory_entries_per_sector = @as(u8, 1) << fat_ctx.misc.directory_entries_per_sector;
+                    const checksum = fat.sfn.checksum(stored_sfn.result);
+
+                    var current_order: u8 = 1;
+                    var current_stack_index = sector_stack.len - 1;
+                    var current_sector_index = sector_stack[current_stack_index];
+                    var current_sector = try blk.map(current_sector_index);
+                    var current_entry_reversed = entry_location.sector_entry_end;
+                    var lfn_current_character: u8 = 0;
+
+                    const sfn_entry = v: {
+                        const last_directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
+                        const last_directory_entry = &last_directory_entries[current_entry_reversed];
+
+                        try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, last_directory_entry, stored_sfn, entry_info);
+                        break :v last_directory_entry.*;
+                    };
+
+                    while (true) {
+                        while (current_entry_reversed >= 1 and current_order < needed_lfn_entries) : ({
+                            current_entry_reversed -= 1;
+                            current_order += 1;
+                        }) {
+                            const lfn_entry = current_entry_reversed - 1;
+                            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
+                            const lfn: *LongFileNameEntry = @ptrCast(&directory_entries[lfn_entry]);
+
+                            lfn.* = LongFileNameEntry.init(current_order, checksum, name[lfn_current_character..]);
+                            lfn_current_character += LongFileNameEntry.stored_name_length;
+                        }
+
+                        if (current_order == needed_lfn_entries) {
+                            const first_sector_index, const first_sector, const first_entry = if (current_entry_reversed == 0) v: {
+                                std.debug.assert(current_stack_index > 0);
+
+                                defer blk.unmap(current_sector_index, current_sector);
+                                try blk.commit(current_sector_index, current_sector);
+
+                                current_stack_index -= 1;
+                                std.debug.assert(current_stack_index == 0);
+
+                                const first_sector_index = sector_stack[current_stack_index];
+                                const first_sector = try blk.map(first_sector_index);
+
+                                break :v .{ first_sector_index, first_sector, directory_entries_per_sector - 1 };
+                            } else .{ current_sector_index, current_sector, current_entry_reversed - 1 };
+
+                            defer blk.unmap(first_sector_index, first_sector);
+
+                            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
+                            const lfn: *LongFileNameEntry = @ptrCast(&directory_entries[first_entry]);
+                            lfn.* = LongFileNameEntry.initLast(needed_lfn_entries, checksum, name[lfn_current_character..]);
+
+                            try blk.commit(first_sector_index, first_sector);
+                            return DirectoryEntry.fromDiskEntry(sfn_entry, entry_location);
+                        }
+
+                        {
+                            defer blk.unmap(current_sector_index, current_sector);
+                            try blk.commit(current_sector_index, current_sector);
+                        }
+
+                        std.debug.assert(current_stack_index > 0);
+                        current_stack_index -= 1;
+                        current_sector_index = sector_stack[current_stack_index];
+                        current_sector = try blk.map(current_sector_index);
+                        current_entry_reversed = directory_entries_per_sector;
+                    }
                 }
             } else fat_ctx.createShort(blk, directory, name, entry_info);
         }
 
-        pub fn createShort(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8, entry_info: CreationInfo) CreateEntryError!DirectoryEntry {
+        pub fn createShortContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8, entry_info: CreationInfo) CreateEntryError!DirectoryEntry {
             const directory_cluster = if (directory) |dir| v: {
                 break :v dir.entry.cluster;
             } else fat_ctx.getRootCluster();
@@ -1311,8 +1372,10 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     defer blk.unmap(free, sector);
                     const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
 
-                    // NOTE: Here we don't care if the conversion os lossy or not
-                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[free_entry], sfn.codepageToShortFilename(name).sfn, entry_info);
+                    // NOTE: Here we don't care if the conversion is lossy or not
+                    // TODO: Codepage context
+                    const store_result = fat.sfn.store(name, fat.AsciiCodepageContext{});
+                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[free_entry], store_result, entry_info);
 
                     try blk.commit(free, sector);
                     return DirectoryEntry.fromDiskEntry(directory_entries[free_entry], DirectoryEntrySectorLocation.fromSingleEntry(free, free_entry));
@@ -1331,7 +1394,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             }
         }
 
-        inline fn createDiskDirectoryEntry(fat_ctx: *Self, blk: *BlockDevice, directory_cluster: Cluster, entry: *DiskDirectoryEntry, name: [sfn.len]u8, entry_info: CreationInfo) !void {
+        fn createDiskDirectoryEntry(fat_ctx: *Self, blk: *BlockDevice, directory_cluster: Cluster, entry: *DiskDirectoryEntry, stored_name: fat.sfn.StoreResult, entry_info: CreationInfo) !void {
             const allocated_cluster, const file_size = switch (entry_info.type) {
                 .directory => |entries| v: {
                     const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
@@ -1359,7 +1422,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 },
             };
 
-            entry.* = entry_info.asDiskDirectoryEntry(name, @as(Cluster, allocated_cluster), file_size);
+            entry.* = entry_info.asDiskDirectoryEntry(stored_name.result, fat.ExtraAttributes{ .lower_base = stored_name.lower_base, .lower_extension = stored_name.lower_extension }, @as(Cluster, allocated_cluster), file_size);
         }
 
         fn createDotEntries(fat_ctx: *Self, blk: *BlockDevice, from_cluster: Cluster, first_cluster: Cluster) BlockMapOrCommitError!void {
@@ -1726,5 +1789,6 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 }
 
 test {
+    _ = fat;
     _ = format;
 }

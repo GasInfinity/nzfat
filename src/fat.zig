@@ -32,6 +32,138 @@ pub const div_shift = std.EnumArray(Type, u1).initDefault(null, .{
     .fat32 = 0,
 });
 
+pub const allowed_symbols = "$%'-_@~`!(){}^#&";
+pub const extended_allowed_symbols = allowed_symbols ++ "+,;=[].";
+
+pub const AsciiCodepageContext = struct {
+    pub const AsciiCaseResult = struct { std.BoundedArray(u8, 1), ?bool };
+
+    pub inline fn toUpper(_: AsciiCodepageContext, slice: []const u8) AsciiCaseResult {
+        const c = slice[0];
+        const converted, const is_lower = if (std.ascii.isAlphabetic(c)) v: {
+            const as_upper = std.ascii.toUpper(c);
+            break :v .{ as_upper, c != as_upper };
+        } else .{ c, null };
+
+        return .{ std.BoundedArray(u8, 1).fromSlice(&[_]u8{converted}) catch unreachable, is_lower };
+    }
+
+    pub inline fn toLower(_: AsciiCodepageContext, slice: []const u8) AsciiCaseResult {
+        const c = slice[0];
+        const converted, const is_lower = if (std.ascii.isAlphabetic(c)) v: {
+            const as_lower = std.ascii.toLower(c);
+            break :v .{ as_lower, c == as_lower };
+        } else .{ c, null };
+
+        return .{ std.BoundedArray(u8, 1).fromSlice(&[_]u8{converted}) catch unreachable, is_lower };
+    }
+};
+
+pub const sfn = struct {
+    pub const max_base_len = 8;
+    pub const max_extension_len = 3;
+    pub const stored_len = max_base_len + max_extension_len;
+    pub const max_len = stored_len + 1;
+    // NOTE: +1 Because we may want to add a null terminator
+    pub const Display = std.BoundedArray(u8, max_len + 1);
+
+    pub fn isAllowedCharacter(c: u8) bool {
+        return c > 127 or std.ascii.isAlphanumeric(c) or std.mem.indexOf(u8, allowed_symbols, &[_]u8{c}) != null;
+    }
+
+    pub fn checksum(value: [stored_len]u8) u8 {
+        var sum: u8 = 0;
+
+        inline for (0..value.len) |i| {
+            sum = std.math.rotr(u8, sum, 1) +% value[i];
+        }
+
+        return sum;
+    }
+
+    pub fn display(filename: *Display, stored: [stored_len]u8, base_lower: bool, extension_lower: bool, oem_ctx: anytype) void {
+        const base = std.mem.trimRight(u8, stored[0..max_base_len], " ");
+        const extension = std.mem.trimRight(u8, stored[max_base_len..], " ");
+
+        if (base_lower) {
+            for (0..base.len) |i| {
+                const lower_bytes, _ = oem_ctx.toLower(base[i..]);
+                filename.appendSliceAssumeCapacity(lower_bytes.constSlice());
+            }
+        } else {
+            for (0..base.len) |i| {
+                filename.appendAssumeCapacity(base[i]);
+            }
+        }
+
+        if (extension.len > 0) {
+            filename.appendAssumeCapacity('.');
+
+            if (extension_lower) {
+                for (0..extension.len) |i| {
+                    const lower_bytes, _ = oem_ctx.toLower(extension[i..]);
+                    filename.appendSliceAssumeCapacity(lower_bytes.constSlice());
+                }
+            } else {
+                for (0..extension.len) |i| {
+                    filename.appendAssumeCapacity(extension[i]);
+                }
+            }
+        }
+    }
+
+    pub const StoreResult = struct { result: [stored_len]u8, lossy: bool, lower_base: bool, lower_extension: bool };
+    pub fn store(filename: []const u8, codepage_ctx: anytype) StoreResult {
+        const last_possible_dot = std.mem.lastIndexOf(u8, filename, ".");
+        const base, const extension = if (last_possible_dot) |last_dot|
+            .{ filename[0..last_dot], filename[(last_dot + 1)..] }
+        else
+            .{ filename, &[_]u8{} };
+
+        var stored_sfn: [stored_len]u8 = [_]u8{' '} ** stored_len;
+        const base_result = storePart(max_base_len, stored_sfn[0..max_base_len], base, codepage_ctx);
+        const extension_result = storePart(max_extension_len, stored_sfn[max_base_len..], extension, codepage_ctx);
+
+        const lossy = base_result.lossy or extension_result.lossy;
+        return StoreResult{
+            .result = stored_sfn,
+            .lossy = lossy,
+            .lower_base = !lossy and base_result.lower,
+            .lower_extension = !lossy and extension_result.lower,
+        };
+    }
+
+    const StorePartResult = struct { lossy: bool, lower: bool };
+    fn storePart(comptime max_part_len: comptime_int, buf: *[max_part_len]u8, filename_part: []const u8, oem_ctx: anytype) StorePartResult {
+        var lossy = filename_part.len > max_part_len;
+        var lower: ?bool = null;
+        var index: usize = 0;
+        while (index < filename_part.len and index < max_part_len) {
+            const current_part_slice = filename_part[index..];
+            const upper_bytes, const is_lower = oem_ctx.toUpper(current_part_slice);
+            std.debug.assert(upper_bytes.len <= current_part_slice.len);
+
+            if (index + upper_bytes.len > max_part_len) {
+                break;
+            }
+
+            if (lower) |was_lower| {
+                if (was_lower != is_lower or lossy) {
+                    lossy = true;
+                    lower = false;
+                }
+            } else {
+                lower = is_lower;
+            }
+
+            @memcpy(buf[index..][0..upper_bytes.len], upper_bytes.constSlice());
+            index += upper_bytes.len;
+        }
+
+        return StorePartResult{ .lossy = lossy, .lower = lower orelse false };
+    }
+};
+
 pub fn SuggestCluster(comptime maximum_supported_fat_type: Type) type {
     return switch (maximum_supported_fat_type) {
         .fat12 => u12,
@@ -62,17 +194,21 @@ pub const BiosParameterBlock = extern struct {
 };
 
 pub const ExtendedBootRecord = extern struct {
+    pub const max_boot_code_len = 448;
+
     drive_number: u8 align(1),
     nt_flags: u8 align(1),
     signature: u8 align(1) = 0x29,
     volume_id: [4]u8 align(1),
     label: [11]u8 align(1),
     system_identifier: [8]u8 align(1) = "FAT     ".*,
-    boot_code: [448]u8,
+    boot_code: [max_boot_code_len]u8,
     boot_signature: u16 = 0xAA55,
 };
 
 pub const ExtendedBootRecord32 = extern struct {
+    pub const max_boot_code_len = 420;
+
     sectors_per_fat: u32 align(1),
     flags: u16 align(1), // FIXME: This must be a packed struct
     fat_version: u16 align(1),
@@ -86,7 +222,7 @@ pub const ExtendedBootRecord32 = extern struct {
     volume_id: [4]u8 align(1),
     label: [11]u8 align(1),
     system_identifier: [8]u8 align(1) = "FAT32   ".*,
-    boot_code: [420]u8,
+    boot_code: [max_boot_code_len]u8,
     boot_signature: u16 = 0xAA55,
 };
 
@@ -119,6 +255,13 @@ pub const Attributes = packed struct(u8) {
 pub const Time = packed struct(u16) { seconds: u5, minutes: u6, hours: u5 };
 pub const Date = packed struct(u16) { day: u5, month: u4, year: u7 };
 
+pub const ExtraAttributes = packed struct(u8) {
+    _: u3 = 0,
+    lower_base: bool,
+    lower_extension: bool,
+    _2: u3 = 0,
+};
+
 pub const DirectoryEntry = extern struct {
     pub const deletion_flag = 0xE5;
     pub const dot_name = ".          ";
@@ -126,7 +269,7 @@ pub const DirectoryEntry = extern struct {
 
     name: [11]u8 align(1),
     attributes: Attributes align(1),
-    reserved: u8 align(1) = 0,
+    reserved: ExtraAttributes align(1) = std.mem.zeroes(ExtraAttributes),
     creation_time_tenth: u8 align(1),
     creation_time: Time align(1),
     creation_date: Date align(1),
@@ -179,7 +322,7 @@ pub const LongFileNameEntry = extern struct {
 
     pub fn initLast(order: u8, checksum: u8, utf16: []const u16) LongFileNameEntry {
         if (utf16.len == stored_name_length) {
-            return init(order, checksum, utf16);
+            return init(last_entry_mask | order, checksum, utf16);
         }
 
         const name1, const name2, const name3 = names: {
@@ -225,7 +368,7 @@ pub const LongFileNameEntry = extern struct {
         };
 
         return LongFileNameEntry{
-            .order = order,
+            .order = last_entry_mask | order,
             .checksum = checksum,
             .name1 = name1,
             .name2 = name2,
@@ -283,6 +426,137 @@ pub const LongFileNameEntry = extern struct {
         }
 
         @memcpy(buf[(current_end.* - name.len)..current_end.*], name);
+        current_end.* -= name.len;
         return true;
     }
 };
+
+const testing = std.testing;
+
+test "sfn.store handles non-lossy uppercase basename only" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO      ".*,
+        .lossy = false,
+        .lower_base = false,
+        .lower_extension = false,
+    }, sfn.store("HELLO", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles non-lossy lowercase basename only" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO      ".*,
+        .lossy = false,
+        .lower_base = true,
+        .lower_extension = false,
+    }, sfn.store("hello", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles non-lossy uppercase basename and uppercase extension" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO   TXT".*,
+        .lossy = false,
+        .lower_base = false,
+        .lower_extension = false,
+    }, sfn.store("HELLO.TXT", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles non-lossy lowercase basename and uppercase extension" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO   TXT".*,
+        .lossy = false,
+        .lower_base = true,
+        .lower_extension = false,
+    }, sfn.store("hello.TXT", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles non-lossy uppercase basename and lowercase extension" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO   TXT".*,
+        .lossy = false,
+        .lower_base = false,
+        .lower_extension = true,
+    }, sfn.store("HELLO.txt", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles non-lossy lowercase basename and lowercase extension" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO   TXT".*,
+        .lossy = false,
+        .lower_base = true,
+        .lower_extension = true,
+    }, sfn.store("hello.txt", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles lossy basename" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLOWORTXT".*,
+        .lossy = true,
+        .lower_base = false,
+        .lower_extension = false,
+    }, sfn.store("helloworld.txt", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles lossy extension" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "HELLO   TXT".*,
+        .lossy = true,
+        .lower_base = false,
+        .lower_extension = false,
+    }, sfn.store("hello.txtwhat", AsciiCodepageContext{}));
+}
+
+test "sfn.display handles uppercase basename only" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "HELLO      ".*, false, false, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, "HELLO", buf.constSlice());
+}
+
+test "sfn.display handles lowercase basename only" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "HELLO      ".*, true, false, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, "hello", buf.constSlice());
+}
+
+test "sfn.display handles uppercase extension only" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "        TXT".*, false, false, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, ".TXT", buf.constSlice());
+}
+
+test "sfn.display handles lowercase extension only" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "        TXT".*, false, true, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, ".txt", buf.constSlice());
+}
+
+test "sfn.display handles uppercase basename and uppercase extension" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "HELLO   TXT".*, false, false, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, "HELLO.TXT", buf.constSlice());
+}
+
+test "sfn.display handles lowercase basename and uppercase extension" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "HELLO   TXT".*, true, false, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, "hello.TXT", buf.constSlice());
+}
+
+test "sfn.display handles uppercase basename and lowercase extension" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "HELLO   TXT".*, false, true, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, "HELLO.txt", buf.constSlice());
+}
+
+test "sfn.display handles lowercase basename and lowercase extension" {
+    var buf = sfn.Display.init(0) catch unreachable;
+    sfn.display(&buf, "HELLO   TXT".*, true, true, AsciiCodepageContext{});
+
+    try testing.expectEqualSlices(u8, "hello.txt", buf.constSlice());
+}

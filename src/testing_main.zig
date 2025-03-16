@@ -104,6 +104,7 @@ pub fn main() !void {
         },
         else => |t| return t,
     };
+    try stdout.print("{}", .{fat_ctx});
 
     const stdin = std.io.getStdIn().reader();
 
@@ -115,7 +116,7 @@ pub fn main() !void {
     defer current_dir.deinit();
     try current_dir.append(null);
 
-    var buf: [256]u8 = undefined;
+    var buf: [512]u8 = undefined;
     while (true) {
         try stdout.print("{} maps, {} commits\n", .{ floppy_blk_ctx.maps, floppy_blk_ctx.commits });
         try stdout.print("{s} => ", .{current_path.items});
@@ -316,13 +317,16 @@ pub fn main() !void {
 
                     var entries: usize = 0;
                     while (try dir_it.next(&floppy_blk_ctx)) |dir| : (entries += 1) {
+                        var filename = nzfat.ShortFilenameDisplay.init(0) catch unreachable;
+                        dir.displayShortFilename(&filename);
+
                         if (dir.lfn) |lfn| {
                             const long_name = try std.unicode.utf16LeToUtf8Alloc(alloc, lfn);
                             defer alloc.free(long_name);
 
-                            try stdout.print("  {s} ({s})", .{ dir.sfn, long_name });
+                            try stdout.print("  {s} ({s})", .{ filename.constSlice(), long_name });
                         } else {
-                            try stdout.print("  {s}", .{dir.sfn});
+                            try stdout.print("  {s}", .{filename.constSlice()});
                         }
 
                         try stdout.print("   {s}   \n", .{@tagName(dir.entry.type)});
