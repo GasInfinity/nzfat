@@ -68,6 +68,7 @@ const Command = enum {
     cat,
     exit,
     mkdir,
+    rn,
     rm,
     rmdir,
     touch,
@@ -242,6 +243,18 @@ pub fn main() !void {
                         try file.writeAll(&fat_ctx, &floppy_blk_ctx, &("Hello FAT World!\n".* ** 100));
                     } else {
                         try stdout.print("The file does not exist!\n", .{});
+                    }
+                },
+                .rn => {
+                    const next_path = command_args;
+
+                    const utf16_next_path = try std.unicode.utf8ToUtf16LeAlloc(alloc, next_path);
+                    defer alloc.free(utf16_next_path);
+
+                    if (try fat_ctx.search(&floppy_blk_ctx, current_dir.items[current_dir.items.len - 1], utf16_next_path)) |found| {
+                        _ = try fat_ctx.move(&floppy_blk_ctx, found, null, std.unicode.utf8ToUtf16LeStringLiteral("rename.tst"));
+                    } else {
+                        try stdout.print("The file or directory does not exist!\n", .{});
                     }
                 },
                 .append => {

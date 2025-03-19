@@ -124,6 +124,10 @@ pub const sfn = struct {
         const base_result = storePart(max_base_len, stored_sfn[0..max_base_len], base, codepage_ctx);
         const extension_result = storePart(max_extension_len, stored_sfn[max_base_len..], extension, codepage_ctx);
 
+        if (stored_sfn[0] == DirectoryEntry.deletion_flag) {
+            stored_sfn[0] = DirectoryEntry.stored_e5_flag;
+        }
+
         const lossy = base_result.lossy or extension_result.lossy;
         return StoreResult{
             .result = stored_sfn,
@@ -264,6 +268,7 @@ pub const ExtraAttributes = packed struct(u8) {
 
 pub const DirectoryEntry = extern struct {
     pub const deletion_flag = 0xE5;
+    pub const stored_e5_flag = 0x05;
     pub const dot_name = ".          ";
     pub const dot_dot_name = "..         ";
 
@@ -503,6 +508,24 @@ test "sfn.store handles lossy extension" {
         .lower_base = false,
         .lower_extension = false,
     }, sfn.store("hello.txtwhat", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles uppercase basename with 0xE5" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "\x05LLO       ".*,
+        .lossy = false,
+        .lower_base = false,
+        .lower_extension = false,
+    }, sfn.store("\xE5LLO", AsciiCodepageContext{}));
+}
+
+test "sfn.store handles lowercase basename with 0xE5" {
+    try testing.expectEqualDeep(sfn.StoreResult{
+        .result = "\x05LLO       ".*,
+        .lossy = false,
+        .lower_base = true,
+        .lower_extension = false,
+    }, sfn.store("\xE5llo", AsciiCodepageContext{}));
 }
 
 test "sfn.display handles uppercase basename only" {

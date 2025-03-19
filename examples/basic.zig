@@ -71,10 +71,14 @@ const Fat = nzfat.FatFilesystem(BasicBlockContext, .{
         // Self-explanatory, supported lengths of less characters affects the size of some structures (as an entry will span more sectors) but it's not recommended to change this unless it's really needed.
         .maximum_supported_len = 255,
 
-        // This is temporal and will surely change. Currently this `context` implements the conversion between the system codepage (currently only ASCII, a new config option will be added like this one for it) and UTF-16.
-        // Unicode is a hard topic...
+        // Implements the conversion of the system codepage to UTF-16 and the comparison of UTF-16 strings. The default one ONLY and ONLY handles Ascii-insensitive comparison
         // .context =
     },
+
+    // Implements basic toUpper and toLower functions that must return `struct{ BoundedArray(u8, N), ?bool };`, the first return being the converted character and the second whether it was lower, upper or non-alpha (null)
+    // Why do we need to return a BoundedArray? Cursed DBCS FAT volumes exist and you may want to interop with them...
+    // The default one ONLY and ONLY handles Ascii conversions, leaving the upper 128 characters unchanged.
+    // .codepage_context =
 
     // The only supported option right now, maybe in the future a static and dynamic caches will be implemented
     .cache = .none,

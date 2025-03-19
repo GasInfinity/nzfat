@@ -145,7 +145,6 @@ pub const Attributes = packed struct(u8) {
     _: u5 = 0,
 
     pub inline fn toDiskAttributes(attributes: Attributes, is_directory: bool) DiskAttributes {
-        std.debug.assert(attributes._ == 0);
         var disk_attributes: DiskAttributes = @bitCast(attributes);
         disk_attributes.directory = is_directory;
         return disk_attributes;
@@ -204,6 +203,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         const BlockSectorResult = BlockDevice.SectorResult;
         const BlockMapError = BlockDevice.MapError;
         const BlockCommitError = BlockDevice.CommitError;
+        const BlockSizeError = BlockDevice.BlockSizeError;
 
         // FIXME: Proper error propagation
         const BlockMapOrCommitError = BlockMapError || BlockCommitError;
@@ -222,14 +222,11 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
         pub const EntryName = if (config.long_filenames) |_| []const u16 else []const u8;
 
-        // +1 for dot
-        const LongCodepageConversionBuffer = if (config.long_filenames) |_| [fat.sfn.max_len:0]u8 else void;
-        const LongSfnConversionBuffer = if (config.long_filenames) |_| [fat.sfn.stored_len:0]u8 else void;
+        const CodepageContext = config.codepage_context;
         const LongContext = if (config.long_filenames) |long_config| long_config.context else void;
 
         const max_long_filename_entries = if (config.long_filenames) |long_config| ((@as(usize, long_config.maximum_supported_len) + LongFileNameEntry.stored_name_length - 1) / LongFileNameEntry.stored_name_length) else 0;
         const max_file_entries = max_long_filename_entries + 1;
-
         const max_first_long_filename_name_len = if (config.long_filenames) |long_config| (@as(usize, long_config.maximum_supported_len) + LongFileNameEntry.stored_name_length - 1) % LongFileNameEntry.stored_name_length else 0;
 
         pub const RootDirectoryData = union {
@@ -503,6 +500,23 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     .write_time = entry.write_time,
                     .write_date = entry.write_date,
                     .cluster = unpackCluster(entry),
+                    .file_size = entry.file_size,
+                };
+            }
+
+            pub fn toDiskEntry(entry: DirectoryEntry, stored_name: fat.sfn.StoreResult) DiskDirectoryEntry {
+                return DiskDirectoryEntry{
+                    .name = stored_name.result,
+                    .attributes = entry.attributes.toDiskAttributes(entry.type == .directory),
+                    .reserved = fat.ExtraAttributes{ .lower_base = stored_name.lower_base, .lower_extension = stored_name.lower_extension },
+                    .creation_date = entry.creation_date,
+                    .creation_time = entry.creation_time,
+                    .creation_time_tenth = entry.creation_time_tenth,
+                    .last_access_date = entry.last_access_date,
+                    .write_date = entry.write_date,
+                    .write_time = entry.write_time,
+                    .first_cluster_hi = @intCast(entry.cluster >> 16),
+                    .first_cluster_lo = @intCast(entry.cluster & 0xFFFF),
                     .file_size = entry.file_size,
                 };
             }
@@ -833,25 +847,37 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             // TODO: generic writer()/reader()?
         };
 
-        pub inline fn search(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName) BlockMapOrClusterTraversalError!?DirectoryEntry {
-            if (@sizeOf(LongContext) != 0)
-                @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call searchEntryContext instead.");
-            return fat_ctx.searchContext(blk, directory, name, undefined);
+        pub fn directoryEntryIterator(fat_ctx: *Self, directory: ?Dir) DirectoryEntryIterator {
+            const directory_cluster = if (directory) |dir| v: {
+                break :v dir.entry.cluster;
+            } else fat_ctx.getRootCluster();
+            return DirectoryEntryIterator.init(fat_ctx.diskDirectoryEntryIterator(directory_cluster));
         }
 
-        pub fn searchContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, ctx: LongContext) BlockMapOrClusterTraversalError!?DirectoryEntry {
+        pub inline fn search(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName) BlockMapOrClusterTraversalError!?DirectoryEntry {
+            if (@sizeOf(LongContext) != 0) @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call searchContext instead.");
+            if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call searchContext instead.");
+            return fat_ctx.searchContext(blk, directory, name, undefined, undefined);
+        }
+
+        pub inline fn searchShort(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName) BlockMapOrClusterTraversalError!?DirectoryEntry {
+            if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call searchContext instead.");
+            return fat_ctx.searchShortContext(blk, directory, name, undefined);
+        }
+
+        pub fn searchContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, cctx: CodepageContext, lctx: LongContext) BlockMapOrClusterTraversalError!?DirectoryEntry {
             if (config.long_filenames) |_| {
                 var it = fat_ctx.directoryEntryIterator(directory);
                 defer it.deinit(blk);
 
                 var codepage_filename = ShortFilenameDisplay.init(0) catch unreachable;
-                const codepage_conversion_lossy = ctx.utf16LeToCodepage(&codepage_filename, name);
+                const codepage_conversion_lossy = lctx.utf16LeToCodepage(&codepage_filename, name);
                 const codepage_name = codepage_filename.constSlice();
-                const stored = fat.sfn.store(codepage_name, fat.AsciiCodepageContext{});
+                const stored = fat.sfn.store(codepage_name, cctx);
 
                 while (try it.next(blk)) |it_entry| {
                     if (it_entry.lfn) |lfn| {
-                        if (ctx.eql(lfn, name)) {
+                        if (lctx.eql(lfn, name)) {
                             return it_entry.entry;
                         }
                     } else {
@@ -864,11 +890,11 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 }
 
                 return null;
-            } else return searchShort(fat_ctx, blk, directory);
+            } else return searchShortContext(fat_ctx, blk, directory, cctx);
         }
 
-        pub fn searchShort(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8) BlockMapOrClusterTraversalError!?DirectoryEntry {
-            const stored = fat.sfn.store(name, fat.AsciiCodepageContext{});
+        pub fn searchShortContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8, ctx: CodepageContext) BlockMapOrClusterTraversalError!?DirectoryEntry {
+            const stored = fat.sfn.store(name, ctx);
 
             if (stored.lossy) {
                 // HACK: Return error?
@@ -887,11 +913,512 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             return null;
         }
 
-        pub fn directoryEntryIterator(fat_ctx: *Self, directory: ?Dir) DirectoryEntryIterator {
+        pub fn delete(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry) DeleteClustersError!void {
+            if (entry.cluster != 0) {
+                try fat_ctx.deleteClusterChain(blk, entry.cluster);
+            }
+
+            try fat_ctx.deleteDiskDirectoryEntries(blk, entry);
+        }
+
+        pub inline fn create(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, entry_info: CreationInfo) !DirectoryEntry {
+            if (@sizeOf(LongContext) != 0) @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call createContext instead.");
+            if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call createContext instead.");
+            return fat_ctx.createContext(blk, directory, name, entry_info, undefined, undefined);
+        }
+
+        pub inline fn createShort(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, entry_info: CreationInfo) !DirectoryEntry {
+            if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call createShortContext instead.");
+            return fat_ctx.createShortKindContext(blk, directory, name, .{ .new = entry_info }, undefined);
+        }
+
+        pub inline fn createShortContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, entry_info: CreationInfo, ctx: CodepageContext) !DirectoryEntry {
+            return fat_ctx.createShortKindContext(blk, directory, name, .{ .new = entry_info }, ctx);
+        }
+
+        pub inline fn createContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, entry_info: CreationInfo, cctx: CodepageContext, lctx: LongContext) !DirectoryEntry {
+            return fat_ctx.createKindContext(blk, directory, name, .{ .new = entry_info }, cctx, lctx);
+        }
+
+        pub inline fn move(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry, new_location: ?Dir, new_name: EntryName) !DirectoryEntry {
+            if (@sizeOf(LongContext) != 0) @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call moveContext instead.");
+            if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call moveContext instead.");
+            return fat_ctx.moveContext(blk, entry, new_location, new_name, undefined, undefined);
+        }
+
+        pub inline fn moveShort(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry, new_location: ?Dir, new_name: EntryName) !DirectoryEntry {
+            if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call moveShortContext instead.");
+            return fat_ctx.moveShortContext(blk, entry, new_location, new_name, undefined);
+        }
+
+        // XXX: This may fail when we reach maxInt(u16) entries or the limit of root entries, FIX IT!
+        pub inline fn moveShortContext(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry, new_location: ?Dir, new_name: []const u8, ctx: CodepageContext) !DirectoryEntry {
+            try fat_ctx.deleteDiskDirectoryEntries(blk, entry);
+            return fat_ctx.createShortKindContext(blk, new_location, new_name, .{ .move = entry }, ctx);
+        }
+
+        pub inline fn moveContext(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry, new_location: ?Dir, new_name: EntryName, cctx: CodepageContext, lctx: LongContext) !DirectoryEntry {
+            try fat_ctx.deleteDiskDirectoryEntries(blk, entry);
+            return fat_ctx.createKindContext(blk, new_location, new_name, .{ .move = entry }, cctx, lctx);
+        }
+
+        pub fn isDirectoryEmpty(fat_ctx: *Self, blk: *BlockDevice, directory: Dir) BlockMapOrClusterTraversalError!bool {
+            var it = fat_ctx.diskDirectoryEntryIterator(directory.entry.cluster);
+            defer it.deinit(blk);
+
+            // NOTE: Should we fail only when reading?
+            try expectDiskDirectoryEntry(&it, blk, DiskDirectoryEntry.dot_name);
+            try expectDiskDirectoryEntry(&it, blk, DiskDirectoryEntry.dot_dot_name);
+
+            while (try it.next(blk)) |dir| {
+                if (!dir.isFree()) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        fn expectDiskDirectoryEntry(it: *DiskDirectoryEntryIterator, blk: *BlockDevice, comptime name: *const [fat.sfn.stored_len]u8) BlockMapOrClusterTraversalError!void {
+            if (try it.next(blk)) |dir| {
+                if (!std.mem.eql(u8, &dir.name, name)) {
+                    return; // TODO: Error
+                }
+
+                return;
+            }
+
+            return; // TODO: Error
+        }
+
+        fn deleteClusterChain(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) DeleteClustersError!void {
+            var current = start;
+
+            while (try fat_ctx.writeNextAllocatedCluster(blk, current, .free)) |next| {
+                current = next;
+            }
+        }
+
+        fn deleteDiskDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry) BlockMapOrCommitError!void {
+            const sector_stack = entry.location.getSectorStack();
+
+            if (sector_stack.len == 1) {
+                const sector_index = sector_stack[0];
+                const sector = try blk.map(sector_index);
+                defer blk.unmap(sector_index, sector);
+
+                const directories: []DiskDirectoryEntry = @alignCast(std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice()));
+                const start = entry.location.sector_entry_start;
+
+                if (DirectoryEntrySectorLocation.is_single_entry) {
+                    directories[start].name[0] = DiskDirectoryEntry.deletion_flag;
+                } else {
+                    const end = entry.location.sector_entry_end + 1;
+
+                    for (start..end) |i| {
+                        directories[i].name[0] = DiskDirectoryEntry.deletion_flag;
+                    }
+                }
+
+                try blk.commit(sector_index, sector);
+                return;
+            }
+
+            const directory_entries_per_sector = @as(u8, 1) << fat_ctx.misc.directory_entries_per_sector;
+
+            {
+                const current_sector_index = sector_stack[0];
+                try deleteSectorDirectoryEntries(blk, current_sector_index, entry.location.sector_entry_start, directory_entries_per_sector);
+            }
+
+            const full_sector_stack_end = sector_stack.len - 1;
+            var current_stack_index: usize = 1;
+
+            while (current_stack_index < full_sector_stack_end) : (current_stack_index += 1) {
+                const current_sector_index = sector_stack[current_stack_index];
+                try deleteSectorDirectoryEntries(blk, current_sector_index, 0, directory_entries_per_sector);
+            }
+
+            {
+                const current_sector_index = sector_stack[current_stack_index];
+                const end = entry.location.sector_entry_end + 1;
+
+                try deleteSectorDirectoryEntries(blk, current_sector_index, 0, end);
+            }
+        }
+
+        fn deleteSectorDirectoryEntries(blk: *BlockDevice, sector_index: BlockSector, start: u8, end: u8) BlockMapOrCommitError!void {
+            const sector = try blk.map(sector_index);
+            defer blk.unmap(sector_index, sector);
+
+            const directories: []DiskDirectoryEntry = @alignCast(std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice()));
+
+            for (start..end) |i| {
+                directories[i].name[0] = 0xE5;
+            }
+
+            try blk.commit(sector_index, sector);
+        }
+
+        fn createShortKindContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8, kind: CreationKind, ctx: CodepageContext) CreateEntryError!DirectoryEntry {
             const directory_cluster = if (directory) |dir| v: {
                 break :v dir.entry.cluster;
             } else fat_ctx.getRootCluster();
-            return DirectoryEntryIterator.init(fat_ctx.diskDirectoryEntryIterator(directory_cluster));
+
+            var dir_it = fat_ctx.diskDirectoryEntryIterator(directory_cluster);
+            defer dir_it.deinit(blk);
+
+            var iterated_entries: u16 = 0;
+            var free_sector: ?BlockSector, const free_entry = while (try dir_it.next(blk)) |dirent| {
+                iterated_entries += 1;
+
+                if (dirent.isFree()) {
+                    break .{ dir_it.lastSector(), dir_it.lastSectorEntry() };
+                }
+            } else .{ null, 0 };
+
+            if (iterated_entries == std.math.maxInt(u16)) {
+                return EntryCreationError.NoSpaceLeft;
+            }
+
+            while (true) {
+                if (free_sector) |free| {
+                    const sector = try blk.map(free);
+                    defer blk.unmap(free, sector);
+                    const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
+
+                    // NOTE: Here we don't care if the conversion is lossy or not
+                    // TODO: Codepage context
+                    const store_result = fat.sfn.store(name, ctx);
+                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[free_entry], store_result, kind);
+
+                    try blk.commit(free, sector);
+                    return DirectoryEntry.fromDiskEntry(directory_entries[free_entry], DirectoryEntrySectorLocation.fromSingleEntry(free, free_entry));
+                }
+
+                const last_cluster = dir_it.current_cluster;
+                if (last_cluster == 0) {
+                    return EntryCreationError.OutOfRootDirectoryEntries;
+                }
+
+                const newly_allocated_cluster = try fat_ctx.allocateDirectoryClusters(blk, 1);
+                _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = newly_allocated_cluster });
+
+                free_sector = fat_ctx.cluster2Sector(newly_allocated_cluster);
+                // NOTE: The free entry will be at the start of the sector
+            }
+        }
+
+        const CreationKind = union(enum) { new: CreationInfo, move: DirectoryEntry };
+        fn createKindContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, kind: CreationKind, cctx: CodepageContext, lctx: LongContext) !DirectoryEntry {
+            if (config.long_filenames) |_| {
+                const directory_cluster = if (directory) |dir| v: {
+                    break :v dir.entry.cluster;
+                } else fat_ctx.getRootCluster();
+
+                var codepage_filename = ShortFilenameDisplay.init(0) catch unreachable;
+                // TODO: Check duplicate short names and do something?
+                const codepage_conversion_lossy = lctx.utf16LeToCodepage(&codepage_filename, name);
+                const codepage_name = codepage_filename.constSlice();
+
+                // TODO: Codepage context
+                const stored_sfn = fat.sfn.store(codepage_name, cctx);
+
+                const needs_lfn = codepage_conversion_lossy or stored_sfn.lossy;
+                const needed_lfn_entries: u8 = if (needs_lfn) (1 + (@as(u8, @intCast(name.len)) / LongFileNameEntry.stored_name_length)) else 0;
+                const needed_entries = needed_lfn_entries + 1;
+
+                const entry_location: DirectoryEntrySectorLocation = try fat_ctx.searchFreeDiskDirectoryEntries(blk, directory_cluster, needed_entries);
+                const sector_stack = entry_location.getSectorStack();
+
+                if (sector_stack.len == 1) {
+                    const start = entry_location.sector_entry_start;
+                    const end = entry_location.sector_entry_end;
+
+                    const sector_index = entry_location.sector_stack[0];
+                    const sector = try blk.map(sector_index);
+                    defer blk.unmap(sector_index, sector);
+
+                    const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
+
+                    if (start != end) {
+                        const checksum = fat.sfn.checksum(stored_sfn.result);
+
+                        var current_entry = end - 1;
+                        var lfn_current_character: u8 = 0;
+
+                        for (1..needed_lfn_entries) |current| {
+                            const current_lfn_entry: *LongFileNameEntry = @ptrCast(&directory_entries[current_entry]);
+                            const order: u8 = @intCast(current);
+
+                            current_lfn_entry.* = LongFileNameEntry.init(order, checksum, name[lfn_current_character..]);
+                            lfn_current_character += LongFileNameEntry.stored_name_length;
+                            current_entry -= 1;
+                        }
+
+                        const last_lfn_entry: *LongFileNameEntry = @ptrCast(&directory_entries[current_entry]);
+                        last_lfn_entry.* = LongFileNameEntry.initLast(needed_lfn_entries, checksum, name[lfn_current_character..]);
+                    }
+
+                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[end], stored_sfn, kind);
+                    try blk.commit(sector_index, sector);
+                    return DirectoryEntry.fromDiskEntry(directory_entries[end], entry_location);
+                } else {
+                    const directory_entries_per_sector = @as(u8, 1) << fat_ctx.misc.directory_entries_per_sector;
+                    const checksum = fat.sfn.checksum(stored_sfn.result);
+
+                    var current_order: u8 = 1;
+                    var current_stack_index = sector_stack.len - 1;
+                    var current_sector_index = sector_stack[current_stack_index];
+                    var current_sector = try blk.map(current_sector_index);
+                    var current_entry_reversed = entry_location.sector_entry_end;
+                    var lfn_current_character: u8 = 0;
+
+                    const sfn_entry = v: {
+                        const last_directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
+                        const last_directory_entry = &last_directory_entries[current_entry_reversed];
+
+                        try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, last_directory_entry, stored_sfn, kind);
+                        break :v last_directory_entry.*;
+                    };
+
+                    while (true) {
+                        while (current_entry_reversed >= 1 and current_order < needed_lfn_entries) : ({
+                            current_entry_reversed -= 1;
+                            current_order += 1;
+                        }) {
+                            const lfn_entry = current_entry_reversed - 1;
+                            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
+                            const lfn: *LongFileNameEntry = @ptrCast(&directory_entries[lfn_entry]);
+
+                            lfn.* = LongFileNameEntry.init(current_order, checksum, name[lfn_current_character..]);
+                            lfn_current_character += LongFileNameEntry.stored_name_length;
+                        }
+
+                        if (current_order == needed_lfn_entries) {
+                            const first_sector_index, const first_sector, const first_entry = if (current_entry_reversed == 0) v: {
+                                std.debug.assert(current_stack_index > 0);
+
+                                defer blk.unmap(current_sector_index, current_sector);
+                                try blk.commit(current_sector_index, current_sector);
+
+                                current_stack_index -= 1;
+                                std.debug.assert(current_stack_index == 0);
+
+                                const first_sector_index = sector_stack[current_stack_index];
+                                const first_sector = try blk.map(first_sector_index);
+
+                                break :v .{ first_sector_index, first_sector, directory_entries_per_sector - 1 };
+                            } else .{ current_sector_index, current_sector, current_entry_reversed - 1 };
+
+                            defer blk.unmap(first_sector_index, first_sector);
+
+                            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
+                            const lfn: *LongFileNameEntry = @ptrCast(&directory_entries[first_entry]);
+                            lfn.* = LongFileNameEntry.initLast(needed_lfn_entries, checksum, name[lfn_current_character..]);
+
+                            try blk.commit(first_sector_index, first_sector);
+                            return DirectoryEntry.fromDiskEntry(sfn_entry, entry_location);
+                        }
+
+                        {
+                            defer blk.unmap(current_sector_index, current_sector);
+                            try blk.commit(current_sector_index, current_sector);
+                        }
+
+                        std.debug.assert(current_stack_index > 0);
+                        current_stack_index -= 1;
+                        current_sector_index = sector_stack[current_stack_index];
+                        current_sector = try blk.map(current_sector_index);
+                        current_entry_reversed = directory_entries_per_sector;
+                    }
+                }
+            } else fat_ctx.createShortContext(blk, directory, name, kind);
+        }
+
+        fn searchFreeDiskDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, directory_cluster: Cluster, needed_entries: u8) !DirectoryEntrySectorLocation {
+            const directory_entries_per_sector = @as(u8, 1) << fat_ctx.misc.directory_entries_per_sector;
+
+            var entry_location: DirectoryEntrySectorLocation = std.mem.zeroes(DirectoryEntrySectorLocation);
+
+            var iterated_entries: u16 = 0;
+            var sequential_entries: usize = 0;
+
+            var dir_it = fat_ctx.diskDirectoryEntryIterator(directory_cluster);
+            defer dir_it.deinit(blk);
+
+            while (true) {
+                // HACK: We do this as we know the implementation of the iterator. It allows us to continue iterating if we added a cluster
+                while (try dir_it.next(blk)) |dirent| {
+                    iterated_entries += 1;
+
+                    if (iterated_entries == std.math.maxInt(u16)) {
+                        return EntryCreationError.NoSpaceLeft;
+                    }
+
+                    if (!dirent.isFree()) {
+                        entry_location.sector_entry_start = 0;
+                        entry_location.sector_entry_end = 0;
+                        entry_location.sector_stack_current = 0;
+                        continue;
+                    }
+
+                    if (entry_location.sector_stack_current == 0) {
+                        entry_location.sector_stack[0] = dir_it.lastSector();
+                        entry_location.sector_stack_current += 1;
+
+                        entry_location.sector_entry_start = dir_it.lastSectorEntry();
+                        entry_location.sector_entry_end = entry_location.sector_entry_start;
+                    } else {
+                        entry_location.sector_entry_end = dir_it.lastSectorEntry();
+
+                        const last_sector = entry_location.sector_stack[entry_location.sector_stack_current - 1];
+                        const current_sector = dir_it.lastSector();
+
+                        if (last_sector != current_sector) {
+                            entry_location.sector_stack[entry_location.sector_stack_current] = current_sector;
+                            entry_location.sector_stack_current += 1;
+                        }
+                    }
+
+                    sequential_entries += 1;
+                    if (sequential_entries == needed_entries) {
+                        return entry_location;
+                    }
+                }
+
+                const last_cluster = dir_it.current_cluster;
+
+                if (last_cluster == 0) {
+                    return EntryCreationError.OutOfRootDirectoryEntries;
+                }
+
+                const needed_clusters = (((needed_entries - sequential_entries) + directory_entries_per_sector) >> fat_ctx.misc.directory_entries_per_sector) >> fat_ctx.misc.sectors_per_cluster;
+                const newly_allocated_cluster = try fat_ctx.allocateDirectoryClusters(blk, needed_clusters);
+                _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = newly_allocated_cluster });
+            }
+        }
+
+        fn createDiskDirectoryEntry(fat_ctx: *Self, blk: *BlockDevice, directory_cluster: Cluster, entry: *DiskDirectoryEntry, stored_name: fat.sfn.StoreResult, kind: CreationKind) !void {
+            switch (kind) {
+                .move => |last_entry| entry.* = last_entry.toDiskEntry(stored_name),
+                .new => |new_entry_info| {
+                    const allocated_cluster, const file_size = switch (new_entry_info.type) {
+                        .directory => |entries| v: {
+                            const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
+                            const directory_entries_per_cluster = directory_entries_per_sector << fat_ctx.misc.sectors_per_cluster;
+
+                            // NOTE: We add 2 as we must add the '.' and '..' entries.
+                            const needed_clusters = (((1 + entries) +| directory_entries_per_cluster) >> fat_ctx.misc.directory_entries_per_sector) >> fat_ctx.misc.sectors_per_cluster;
+                            const first_allocated = try fat_ctx.allocateDirectoryClusters(blk, needed_clusters);
+                            try fat_ctx.createDotEntries(blk, directory_cluster, first_allocated);
+
+                            break :v .{ first_allocated, 0 };
+                        },
+                        .file => |size| v: {
+                            const bytes_per_sector = @as(usize, 1) << fat_ctx.misc.bytes_per_sector;
+                            const bytes_per_cluster = bytes_per_sector << fat_ctx.misc.sectors_per_cluster;
+
+                            const needed_clusters = ((size + bytes_per_cluster - 1) >> fat_ctx.misc.bytes_per_sector) >> fat_ctx.misc.sectors_per_cluster;
+
+                            if (needed_clusters == 0) {
+                                break :v .{ 0, 0 };
+                            }
+
+                            const allocated_clusters = try fat_ctx.allocateClusters(blk, needed_clusters);
+                            break :v .{ allocated_clusters, size };
+                        },
+                    };
+
+                    entry.* = new_entry_info.asDiskDirectoryEntry(stored_name.result, fat.ExtraAttributes{ .lower_base = stored_name.lower_base, .lower_extension = stored_name.lower_extension }, @as(Cluster, allocated_cluster), file_size);
+                },
+            }
+        }
+
+        fn createDotEntries(fat_ctx: *Self, blk: *BlockDevice, from_cluster: Cluster, first_cluster: Cluster) BlockMapOrCommitError!void {
+            const sector_index = fat_ctx.cluster2Sector(first_cluster);
+            const sector = try blk.map(sector_index);
+            defer blk.unmap(sector_index, sector);
+
+            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
+
+            @memset(directory_entries[0..2], std.mem.zeroes(DiskDirectoryEntry));
+            directory_entries[0].name = DiskDirectoryEntry.dot_name.*;
+            directory_entries[0].attributes.directory = true;
+            directory_entries[0].first_cluster_hi = @intCast(first_cluster >> 16);
+            directory_entries[0].first_cluster_lo = @intCast(first_cluster & 0xFFFF);
+            directory_entries[1].name = DiskDirectoryEntry.dot_dot_name.*;
+            directory_entries[1].attributes.directory = true;
+            directory_entries[1].first_cluster_hi = @intCast(from_cluster >> 16);
+            directory_entries[1].first_cluster_lo = @intCast(from_cluster & 0xFFFF);
+            try blk.commit(sector_index, sector);
+        }
+
+        fn allocateDirectoryClusters(fat_ctx: *Self, blk: *BlockDevice, n: usize) !Cluster {
+            const first_allocated = try fat_ctx.allocateClusters(blk, n);
+
+            const sectors_per_cluster = (@as(u8, 1) << fat_ctx.misc.sectors_per_cluster);
+            const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
+
+            var current_cluster = first_allocated;
+            while (true) {
+                const initial_sector_index = fat_ctx.cluster2Sector(current_cluster);
+
+                for (0..sectors_per_cluster) |i| {
+                    const sector_index = initial_sector_index + i;
+                    const sector = try blk.map(sector_index);
+                    defer blk.unmap(sector_index, sector);
+
+                    const directories: []DiskDirectoryEntry = @alignCast(std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice()));
+
+                    // HACK: Is it better to memset it?
+                    for (0..directory_entries_per_sector) |d| {
+                        directories[d].name[0] = 0x00;
+                    }
+
+                    try blk.commit(sector_index, sector);
+                }
+
+                const next_possible_cluster = fat_ctx.readNextAllocatedCluster(blk, current_cluster) catch |e| switch (e) {
+                    ClusterTraversalError.InvalidCluster => unreachable,
+                    else => return e,
+                };
+
+                if (next_possible_cluster) |next_cluster| {
+                    current_cluster = next_cluster;
+                    continue;
+                }
+
+                break;
+            }
+
+            return first_allocated;
+        }
+
+        fn allocateClusters(fat_ctx: *Self, blk: *BlockDevice, n: usize) BlockMapOrCommitOrClusterTraversalError!Cluster {
+            std.debug.assert(n > 0);
+
+            const first_next = try fat_ctx.searchFreeCluster(blk);
+            _ = try fat_ctx.writeFatEntry(blk, first_next, .end_of_file);
+
+            var current_cluster = first_next;
+            var current_allocated: usize = 1;
+            while (current_allocated < n) : (current_allocated += 1) {
+                // TODO: Wraparound when searching
+                const next_free = fat_ctx.linearSearchFreeCluster(blk, current_cluster + 1) catch |e| switch (e) {
+                    ClusterAllocationError.NoSpaceLeft => {
+                        try fat_ctx.deleteClusterChain(blk, first_next);
+                        return e;
+                    },
+                    else => return e,
+                };
+
+                _ = try fat_ctx.writeFatEntry(blk, current_cluster, .{ .allocated = next_free });
+                current_cluster = next_free;
+            }
+
+            _ = try fat_ctx.writeFatEntry(blk, current_cluster, .end_of_file);
+            return first_next;
         }
 
         const DirectoryEntryIterator = struct {
@@ -906,7 +1433,12 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 _casing: ShortFilenameCasing,
 
                 pub inline fn displayShortFilename(entry: Entry, filename: *ShortFilenameDisplay) void {
-                    fat.sfn.display(filename, entry.sfn.*, entry._casing.lower_base, entry._casing.lower_extension, fat.AsciiCodepageContext{});
+                    if (@sizeOf(CodepageContext) != 0) @compileError("Cannot infer context " ++ @typeName(CodepageContext) ++ ", call displayShortFilenameContext instead.");
+                    entry.displayShortFilenameContext(filename, undefined);
+                }
+
+                pub inline fn displayShortFilenameContext(entry: Entry, filename: *ShortFilenameDisplay, ctx: CodepageContext) void {
+                    fat.sfn.display(filename, entry.sfn.*, entry._casing.lower_base, entry._casing.lower_extension, ctx);
                 }
             };
 
@@ -1044,472 +1576,18 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 }
 
                 @memcpy(&it.sfn, &entry.name);
+
+                if (it.sfn[0] == DiskDirectoryEntry.stored_e5_flag) {
+                    it.sfn[0] = 0xE5;
+                }
+
                 return Entry{ .sfn = &it.sfn, .lfn = lfn, .entry = DirectoryEntry.fromDiskEntry(entry, it.current_location), ._casing = entry.reserved };
             }
 
-            pub fn deinit(it: *DirectoryEntryIterator, blk: *BlockDevice) void {
+            pub inline fn deinit(it: *DirectoryEntryIterator, blk: *BlockDevice) void {
                 it.it.deinit(blk);
             }
         };
-
-        pub fn delete(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry) DeleteClustersError!void {
-            if (entry.cluster != 0) {
-                try fat_ctx.deleteClusterChain(blk, entry.cluster);
-            }
-
-            try fat_ctx.deleteDiskDirectoryEntries(blk, entry);
-        }
-
-        pub fn isDirectoryEmpty(fat_ctx: *Self, blk: *BlockDevice, directory: Dir) BlockMapOrClusterTraversalError!bool {
-            var it = fat_ctx.diskDirectoryEntryIterator(directory.entry.cluster);
-            defer it.deinit(blk);
-
-            // NOTE: Should we fail only when reading?
-            try expectDiskDirectoryEntry(&it, blk, DiskDirectoryEntry.dot_name);
-            try expectDiskDirectoryEntry(&it, blk, DiskDirectoryEntry.dot_dot_name);
-
-            while (try it.next(blk)) |dir| {
-                if (!dir.isFree()) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        fn expectDiskDirectoryEntry(it: *DiskDirectoryEntryIterator, blk: *BlockDevice, comptime name: *const [fat.sfn.stored_len]u8) BlockMapOrClusterTraversalError!void {
-            if (try it.next(blk)) |dir| {
-                if (!std.mem.eql(u8, &dir.name, name)) {
-                    return; // TODO: Error
-                }
-
-                return;
-            }
-
-            return; // TODO: Error
-        }
-
-        fn deleteClusterChain(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) DeleteClustersError!void {
-            var current = start;
-
-            while (try fat_ctx.writeNextAllocatedCluster(blk, current, .free)) |next| {
-                current = next;
-            }
-        }
-
-        fn deleteDiskDirectoryEntries(fat_ctx: *Self, blk: *BlockDevice, entry: DirectoryEntry) BlockMapOrCommitError!void {
-            const sector_stack = entry.location.getSectorStack();
-
-            if (sector_stack.len == 1) {
-                const sector_index = sector_stack[0];
-                const sector = try blk.map(sector_index);
-                defer blk.unmap(sector_index, sector);
-
-                const directories: []DiskDirectoryEntry = @alignCast(std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice()));
-                const start = entry.location.sector_entry_start;
-
-                if (DirectoryEntrySectorLocation.is_single_entry) {
-                    directories[start].name[0] = DiskDirectoryEntry.deletion_flag;
-                } else {
-                    const end = entry.location.sector_entry_end + 1;
-
-                    for (start..end) |i| {
-                        directories[i].name[0] = DiskDirectoryEntry.deletion_flag;
-                    }
-                }
-
-                try blk.commit(sector_index, sector);
-                return;
-            }
-
-            const directory_entries_per_sector = @as(u8, 1) << fat_ctx.misc.directory_entries_per_sector;
-
-            {
-                const current_sector_index = sector_stack[0];
-                try deleteSectorDirectoryEntries(blk, current_sector_index, entry.location.sector_entry_start, directory_entries_per_sector);
-            }
-
-            const full_sector_stack_end = sector_stack.len - 1;
-            var current_stack_index: usize = 1;
-
-            while (current_stack_index < full_sector_stack_end) : (current_stack_index += 1) {
-                const current_sector_index = sector_stack[current_stack_index];
-                try deleteSectorDirectoryEntries(blk, current_sector_index, 0, directory_entries_per_sector);
-            }
-
-            {
-                const current_sector_index = sector_stack[current_stack_index];
-                const end = entry.location.sector_entry_end + 1;
-
-                try deleteSectorDirectoryEntries(blk, current_sector_index, 0, end);
-            }
-        }
-
-        fn deleteSectorDirectoryEntries(blk: *BlockDevice, sector_index: BlockSector, start: u8, end: u8) BlockMapOrCommitError!void {
-            const sector = try blk.map(sector_index);
-            defer blk.unmap(sector_index, sector);
-
-            const directories: []DiskDirectoryEntry = @alignCast(std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice()));
-
-            for (start..end) |i| {
-                directories[i].name[0] = 0xE5;
-            }
-
-            try blk.commit(sector_index, sector);
-        }
-
-        pub inline fn create(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, entry_info: CreationInfo) !DirectoryEntry {
-            if (@sizeOf(LongContext) != 0)
-                @compileError("Cannot infer context " ++ @typeName(LongContext) ++ ", call createEntryContext instead.");
-            return fat_ctx.createContext(blk, directory, name, entry_info, undefined);
-        }
-
-        pub fn createContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: EntryName, entry_info: CreationInfo, ctx: LongContext) !DirectoryEntry {
-            if (config.long_filenames) |_| {
-                const directory_cluster = if (directory) |dir| v: {
-                    break :v dir.entry.cluster;
-                } else fat_ctx.getRootCluster();
-
-                var codepage_filename = ShortFilenameDisplay.init(0) catch unreachable;
-                // TODO: Check duplicate short names and do something?
-                const codepage_conversion_lossy = ctx.utf16LeToCodepage(&codepage_filename, name);
-                const codepage_name = codepage_filename.constSlice();
-
-                // TODO: Codepage context
-                const stored_sfn = fat.sfn.store(codepage_name, fat.AsciiCodepageContext{});
-
-                const needs_lfn = codepage_conversion_lossy or stored_sfn.lossy;
-                const needed_lfn_entries: u8 = if (needs_lfn) (1 + (@as(u8, @intCast(name.len)) / LongFileNameEntry.stored_name_length)) else 0;
-                const needed_entries = needed_lfn_entries + 1;
-
-                var entry_location: DirectoryEntrySectorLocation = std.mem.zeroes(DirectoryEntrySectorLocation);
-
-                searching_entries: while (true) {
-                    var dir_it = fat_ctx.diskDirectoryEntryIterator(directory_cluster);
-                    defer dir_it.deinit(blk);
-
-                    var iterated_entries: u16 = 0;
-                    var sequential_entries: usize = 0;
-                    while (try dir_it.next(blk)) |dirent| {
-                        iterated_entries += 1;
-
-                        if (iterated_entries == std.math.maxInt(u16)) {
-                            return EntryCreationError.NoSpaceLeft;
-                        }
-
-                        if (!dirent.isFree()) {
-                            entry_location.sector_entry_start = 0;
-                            entry_location.sector_entry_end = 0;
-                            entry_location.sector_stack_current = 0;
-                            continue;
-                        }
-
-                        if (entry_location.sector_stack_current == 0) {
-                            entry_location.sector_stack[0] = dir_it.lastSector();
-                            entry_location.sector_stack_current += 1;
-
-                            entry_location.sector_entry_start = dir_it.lastSectorEntry();
-                            entry_location.sector_entry_end = entry_location.sector_entry_start;
-                        } else {
-                            entry_location.sector_entry_end = dir_it.lastSectorEntry();
-
-                            const last_sector = entry_location.sector_stack[entry_location.sector_stack_current - 1];
-                            const current_sector = dir_it.lastSector();
-
-                            if (last_sector != current_sector) {
-                                entry_location.sector_stack[entry_location.sector_stack_current] = current_sector;
-                                entry_location.sector_stack_current += 1;
-                            }
-                        }
-
-                        sequential_entries += 1;
-                        if (sequential_entries == needed_entries) {
-                            break :searching_entries;
-                        }
-                    }
-
-                    const last_cluster = dir_it.current_cluster;
-
-                    if (last_cluster == 0) {
-                        return EntryCreationError.OutOfRootDirectoryEntries;
-                    }
-
-                    const newly_allocated_cluster = try fat_ctx.allocateDirectoryClusters(blk, (DirectoryEntrySectorLocation.max_entry_sectors - 1));
-                    _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = newly_allocated_cluster });
-                }
-
-                const sector_stack = entry_location.getSectorStack();
-
-                if (sector_stack.len == 1) {
-                    const start = entry_location.sector_entry_start;
-                    const end = entry_location.sector_entry_end;
-
-                    const sector_index = entry_location.sector_stack[0];
-                    const sector = try blk.map(sector_index);
-                    defer blk.unmap(sector_index, sector);
-
-                    const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
-
-                    if (start != end) {
-                        const checksum = fat.sfn.checksum(stored_sfn.result);
-
-                        var current_entry = end - 1;
-                        var lfn_current_character: u8 = 0;
-
-                        for (1..needed_lfn_entries) |current| {
-                            const current_lfn_entry: *LongFileNameEntry = @ptrCast(&directory_entries[current_entry]);
-                            const order: u8 = @intCast(current);
-
-                            current_lfn_entry.* = LongFileNameEntry.init(order, checksum, name[lfn_current_character..]);
-                            lfn_current_character += LongFileNameEntry.stored_name_length;
-                            current_entry -= 1;
-                        }
-
-                        const last_lfn_entry: *LongFileNameEntry = @ptrCast(&directory_entries[current_entry]);
-                        last_lfn_entry.* = LongFileNameEntry.initLast(needed_lfn_entries, checksum, name[lfn_current_character..]);
-                    }
-
-                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[end], stored_sfn, entry_info);
-                    try blk.commit(sector_index, sector);
-                    return DirectoryEntry.fromDiskEntry(directory_entries[end], entry_location);
-                } else {
-                    const directory_entries_per_sector = @as(u8, 1) << fat_ctx.misc.directory_entries_per_sector;
-                    const checksum = fat.sfn.checksum(stored_sfn.result);
-
-                    var current_order: u8 = 1;
-                    var current_stack_index = sector_stack.len - 1;
-                    var current_sector_index = sector_stack[current_stack_index];
-                    var current_sector = try blk.map(current_sector_index);
-                    var current_entry_reversed = entry_location.sector_entry_end;
-                    var lfn_current_character: u8 = 0;
-
-                    const sfn_entry = v: {
-                        const last_directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
-                        const last_directory_entry = &last_directory_entries[current_entry_reversed];
-
-                        try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, last_directory_entry, stored_sfn, entry_info);
-                        break :v last_directory_entry.*;
-                    };
-
-                    while (true) {
-                        while (current_entry_reversed >= 1 and current_order < needed_lfn_entries) : ({
-                            current_entry_reversed -= 1;
-                            current_order += 1;
-                        }) {
-                            const lfn_entry = current_entry_reversed - 1;
-                            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
-                            const lfn: *LongFileNameEntry = @ptrCast(&directory_entries[lfn_entry]);
-
-                            lfn.* = LongFileNameEntry.init(current_order, checksum, name[lfn_current_character..]);
-                            lfn_current_character += LongFileNameEntry.stored_name_length;
-                        }
-
-                        if (current_order == needed_lfn_entries) {
-                            const first_sector_index, const first_sector, const first_entry = if (current_entry_reversed == 0) v: {
-                                std.debug.assert(current_stack_index > 0);
-
-                                defer blk.unmap(current_sector_index, current_sector);
-                                try blk.commit(current_sector_index, current_sector);
-
-                                current_stack_index -= 1;
-                                std.debug.assert(current_stack_index == 0);
-
-                                const first_sector_index = sector_stack[current_stack_index];
-                                const first_sector = try blk.map(first_sector_index);
-
-                                break :v .{ first_sector_index, first_sector, directory_entries_per_sector - 1 };
-                            } else .{ current_sector_index, current_sector, current_entry_reversed - 1 };
-
-                            defer blk.unmap(first_sector_index, first_sector);
-
-                            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, current_sector.asSlice());
-                            const lfn: *LongFileNameEntry = @ptrCast(&directory_entries[first_entry]);
-                            lfn.* = LongFileNameEntry.initLast(needed_lfn_entries, checksum, name[lfn_current_character..]);
-
-                            try blk.commit(first_sector_index, first_sector);
-                            return DirectoryEntry.fromDiskEntry(sfn_entry, entry_location);
-                        }
-
-                        {
-                            defer blk.unmap(current_sector_index, current_sector);
-                            try blk.commit(current_sector_index, current_sector);
-                        }
-
-                        std.debug.assert(current_stack_index > 0);
-                        current_stack_index -= 1;
-                        current_sector_index = sector_stack[current_stack_index];
-                        current_sector = try blk.map(current_sector_index);
-                        current_entry_reversed = directory_entries_per_sector;
-                    }
-                }
-            } else fat_ctx.createShort(blk, directory, name, entry_info);
-        }
-
-        pub fn createShortContext(fat_ctx: *Self, blk: *BlockDevice, directory: ?Dir, name: []const u8, entry_info: CreationInfo) CreateEntryError!DirectoryEntry {
-            const directory_cluster = if (directory) |dir| v: {
-                break :v dir.entry.cluster;
-            } else fat_ctx.getRootCluster();
-
-            var dir_it = fat_ctx.diskDirectoryEntryIterator(directory_cluster);
-            defer dir_it.deinit(blk);
-
-            var iterated_entries: u16 = 0;
-            var free_sector: ?BlockSector, const free_entry = while (try dir_it.next(blk)) |dirent| {
-                iterated_entries += 1;
-
-                if (dirent.isFree()) {
-                    break .{ dir_it.lastSector(), dir_it.lastSectorEntry() };
-                }
-            } else .{ null, 0 };
-
-            if (iterated_entries == std.math.maxInt(u16)) {
-                return EntryCreationError.NoSpaceLeft;
-            }
-
-            while (true) {
-                if (free_sector) |free| {
-                    const sector = try blk.map(free);
-                    defer blk.unmap(free, sector);
-                    const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
-
-                    // NOTE: Here we don't care if the conversion is lossy or not
-                    // TODO: Codepage context
-                    const store_result = fat.sfn.store(name, fat.AsciiCodepageContext{});
-                    try fat_ctx.createDiskDirectoryEntry(blk, directory_cluster, &directory_entries[free_entry], store_result, entry_info);
-
-                    try blk.commit(free, sector);
-                    return DirectoryEntry.fromDiskEntry(directory_entries[free_entry], DirectoryEntrySectorLocation.fromSingleEntry(free, free_entry));
-                }
-
-                const last_cluster = dir_it.current_cluster;
-                if (last_cluster == 0) {
-                    return EntryCreationError.OutOfRootDirectoryEntries;
-                }
-
-                const newly_allocated_cluster = try fat_ctx.allocateDirectoryClusters(blk, 1);
-                _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = newly_allocated_cluster });
-
-                free_sector = fat_ctx.cluster2Sector(newly_allocated_cluster);
-                // NOTE: The free entry will be at the start of the sector
-            }
-        }
-
-        fn createDiskDirectoryEntry(fat_ctx: *Self, blk: *BlockDevice, directory_cluster: Cluster, entry: *DiskDirectoryEntry, stored_name: fat.sfn.StoreResult, entry_info: CreationInfo) !void {
-            const allocated_cluster, const file_size = switch (entry_info.type) {
-                .directory => |entries| v: {
-                    const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
-                    const directory_entries_per_cluster = directory_entries_per_sector << fat_ctx.misc.sectors_per_cluster;
-
-                    // NOTE: We add 2 as we must add the '.' and '..' entries.
-                    const needed_clusters = ((2 + entries + directory_entries_per_cluster - 1) >> fat_ctx.misc.directory_entries_per_sector) >> fat_ctx.misc.sectors_per_cluster;
-                    const first_allocated = try fat_ctx.allocateDirectoryClusters(blk, needed_clusters);
-                    try fat_ctx.createDotEntries(blk, directory_cluster, first_allocated);
-
-                    break :v .{ first_allocated, 0 };
-                },
-                .file => |size| v: {
-                    const bytes_per_sector = @as(usize, 1) << fat_ctx.misc.bytes_per_sector;
-                    const bytes_per_cluster = bytes_per_sector << fat_ctx.misc.sectors_per_cluster;
-
-                    const needed_clusters = ((size + bytes_per_cluster - 1) >> fat_ctx.misc.bytes_per_sector) >> fat_ctx.misc.sectors_per_cluster;
-
-                    if (needed_clusters == 0) {
-                        break :v .{ 0, 0 };
-                    }
-
-                    const allocated_clusters = try fat_ctx.allocateClusters(blk, needed_clusters);
-                    break :v .{ allocated_clusters, size };
-                },
-            };
-
-            entry.* = entry_info.asDiskDirectoryEntry(stored_name.result, fat.ExtraAttributes{ .lower_base = stored_name.lower_base, .lower_extension = stored_name.lower_extension }, @as(Cluster, allocated_cluster), file_size);
-        }
-
-        fn createDotEntries(fat_ctx: *Self, blk: *BlockDevice, from_cluster: Cluster, first_cluster: Cluster) BlockMapOrCommitError!void {
-            const sector_index = fat_ctx.cluster2Sector(first_cluster);
-            const sector = try blk.map(sector_index);
-            defer blk.unmap(sector_index, sector);
-
-            const directory_entries: []DiskDirectoryEntry = std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice());
-
-            @memset(directory_entries[0..2], std.mem.zeroes(DiskDirectoryEntry));
-            directory_entries[0].name = DiskDirectoryEntry.dot_name.*;
-            directory_entries[0].attributes.directory = true;
-            directory_entries[0].first_cluster_hi = @intCast(first_cluster >> 16);
-            directory_entries[0].first_cluster_lo = @intCast(first_cluster & 0xFFFF);
-            directory_entries[1].name = DiskDirectoryEntry.dot_dot_name.*;
-            directory_entries[1].attributes.directory = true;
-            directory_entries[1].first_cluster_hi = @intCast(from_cluster >> 16);
-            directory_entries[1].first_cluster_lo = @intCast(from_cluster & 0xFFFF);
-            try blk.commit(sector_index, sector);
-        }
-
-        fn allocateDirectoryClusters(fat_ctx: *Self, blk: *BlockDevice, n: usize) !Cluster {
-            const first_allocated = try fat_ctx.allocateClusters(blk, n);
-
-            const sectors_per_cluster = (@as(u8, 1) << fat_ctx.misc.sectors_per_cluster);
-            const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
-
-            var current_cluster = first_allocated;
-            while (true) {
-                const initial_sector_index = fat_ctx.cluster2Sector(current_cluster);
-
-                for (0..sectors_per_cluster) |i| {
-                    const sector_index = initial_sector_index + i;
-                    const sector = try blk.map(sector_index);
-                    defer blk.unmap(sector_index, sector);
-
-                    const directories: []DiskDirectoryEntry = @alignCast(std.mem.bytesAsSlice(DiskDirectoryEntry, sector.asSlice()));
-
-                    // HACK: Is it better to memset it?
-                    for (0..directory_entries_per_sector) |d| {
-                        directories[d].name[0] = 0x00;
-                    }
-
-                    try blk.commit(sector_index, sector);
-                }
-
-                const next_possible_cluster = fat_ctx.readNextAllocatedCluster(blk, current_cluster) catch |e| switch (e) {
-                    ClusterTraversalError.InvalidCluster => unreachable,
-                    else => return e,
-                };
-
-                if (next_possible_cluster) |next_cluster| {
-                    current_cluster = next_cluster;
-                    continue;
-                }
-
-                break;
-            }
-
-            return first_allocated;
-        }
-
-        fn allocateClusters(fat_ctx: *Self, blk: *BlockDevice, n: usize) BlockMapOrCommitOrClusterTraversalError!Cluster {
-            std.debug.assert(n > 0);
-
-            const first_next = try fat_ctx.searchFreeCluster(blk);
-            _ = try fat_ctx.writeFatEntry(blk, first_next, .end_of_file);
-
-            var current_cluster = first_next;
-            var current_allocated: usize = 1;
-            while (current_allocated < n) : (current_allocated += 1) {
-                // TODO: Wraparound when searching
-                const next_free = fat_ctx.linearSearchFreeCluster(blk, current_cluster + 1) catch |e| switch (e) {
-                    ClusterAllocationError.NoSpaceLeft => {
-                        try fat_ctx.deleteClusterChain(blk, first_next);
-                        return e;
-                    },
-                    else => return e,
-                };
-
-                _ = try fat_ctx.writeFatEntry(blk, current_cluster, .{ .allocated = next_free });
-                current_cluster = next_free;
-            }
-
-            _ = try fat_ctx.writeFatEntry(blk, current_cluster, .end_of_file);
-            return first_next;
-        }
 
         inline fn diskDirectoryEntryIterator(fat_ctx: *Self, cluster: Cluster) DiskDirectoryEntryIterator {
             return DiskDirectoryEntryIterator.init(fat_ctx, cluster);
