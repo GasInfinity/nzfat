@@ -348,6 +348,7 @@ pub fn main() !void {
                     try stdout.print("\n{} entries in the directory\n", .{entries});
                 },
                 .exit => {
+                    try fat_ctx.unmount(&floppy_blk_ctx, true);
                     break;
                 },
                 else => |t| try stdout.print("Cannot {}, one or more arguments needed\n", .{t}),

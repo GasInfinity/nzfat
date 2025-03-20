@@ -94,6 +94,8 @@ pub fn main() !void {
     const data = alloc.alloc([512]u8, 2880);
     var blk = BasicBlockContext{ .data = data };
 
+    // This will make a FAT12 filesystem with some predefined parameters as 1.44MB floppy disks are well known.
+    // But you can try to make a FAT16 filesystem or even FAT32! However it is ddvisen against and an error will be returned if there are not enough clusters.
     try nzfat.format.make(&blk, .{
         // The only mandatory config
         .volume_id = [_]u8{ 0x00, 0x00, 0x00, 0x00 },
@@ -107,6 +109,7 @@ pub fn main() !void {
 
     // Any directory entry converted to a file or dir MUST NOT be used after being converted as they won't be updated (Maybe instead store a pointer to the entry instead of copying?)
     // This creates a short directory entry inside '/' (null dir means root), the new entry is a file with an initial size of "Hello World!".len (WARNING: Left uninitialized!)
+    // If you try to iterate the directory from Windows NT, you'll see that the filename will be lowercase as we handle those flags also! NOTE: Make this configurable?
     var created_file = (try fat_ctx.createShort(&blk, null, "short.txt", .{
         .type = .{ .file = "Hello World!".len },
     })).toFile();
@@ -114,7 +117,8 @@ pub fn main() !void {
     // Write the data we allocated before
     try created_file.writeAll(&fat_ctx, &blk, "Hello World!");
 
-    // TODO: try Fat.unmount();
+    // Now unmount the FAT filesystem gracefully and signal that no errors occurred.
+    try fat_ctx.unmount(&blk, true);
 
     // There you have! You just created a FAT12 filesystem and added a file named SHORT.TXT with the contents 'Hello World!'
     // There are a lot of more API's like `search` to search an entry inside a directory, `directoryEntryIterator` to iterate entries inside a directory or `delete` to delete an entry and free it's allocated data.

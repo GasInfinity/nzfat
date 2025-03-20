@@ -32,6 +32,7 @@ pub const div_shift = std.EnumArray(Type, u1).initDefault(null, .{
     .fat32 = 0,
 });
 
+pub const allowed_media_values = [_]u8{ 0xF0, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF };
 pub const allowed_symbols = "$%'-_@~`!(){}^#&";
 pub const extended_allowed_symbols = allowed_symbols ++ "+,;=[].";
 

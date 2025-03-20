@@ -37,10 +37,14 @@ pub const MountError = error{
     InvalidSectorCount,
     /// Invalid root entry count in FAT12/16 filesystem.
     InvalidRootEntries,
+    /// Invalid root cluster in FAT32 filesystem.
+    InvalidRootCluster,
     /// Invalid boot signature in the bios parameter block, it must be 0x55AA
     InvalidBootSignature,
     /// Invalid boot sector in the EBPB of a FAT32 filesystem, it must be 6.
     InvalidBackupSector,
+    /// Invalid Filesystem type inside the EBR32 or EBR.
+    InvalidFilesystemType,
     /// Trying to mount an unsupported higher bit count FAT filesystem.
     UnsupportedFat,
 };
@@ -191,10 +195,8 @@ pub const EntryDeletionError = error{DirectoryNotEmpty};
 pub const WriteError = error{ FileTooBig, NoSpaceLeft };
 
 const MiscData = packed struct(u16) { type: Type, mul: u1, div: u1, bytes_per_sector: u4, sectors_per_cluster: u3, directory_entries_per_sector: u3, _: u2 = 0 };
-const allowed_media_values = [_]u8{ 0xF0, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF };
 
 /// Implements a FAT Filesystem as specified in official documentation with support for its VFAT extension.
-/// TODO: Implement NT flags for short filenames with mixed casing
 pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
     return struct {
         const Self = @This();
@@ -287,7 +289,6 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         data_sector_start: u32,
         max_cluster: Cluster,
 
-        // HACK: Validate informational-only filesys_type
         pub fn mount(blk: *BlockDevice) !Self {
             const first_sector: BlockSectorResult = try blk.map(0);
             defer blk.unmap(0, first_sector);
@@ -323,11 +324,11 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 return MountError.InvalidReservedSectorCount;
             }
 
-            if (std.mem.indexOf(u8, &allowed_media_values, &.{bpb.media_descriptor_type}) == null) {
+            if (std.mem.indexOf(u8, &fat.allowed_media_values, &.{bpb.media_descriptor_type}) == null) {
                 return MountError.InvalidMediaType;
             }
 
-            // const ebr: *align(1) const ExtendedBootRecord = std.mem.bytesAsValue(ExtendedBootRecord, first_sector_data[@sizeOf(BiosParameterBlock)..]);
+            const ebr: *align(1) const ExtendedBootRecord = std.mem.bytesAsValue(ExtendedBootRecord, first_sector_data[@sizeOf(BiosParameterBlock)..]);
             const ebr32: *align(1) const ExtendedBootRecord32 = std.mem.bytesAsValue(ExtendedBootRecord32, first_sector_data[@sizeOf(BiosParameterBlock)..]);
 
             const bytes_per_sector_shift: u4 = @intCast(std.math.log2(bytes_per_sector));
@@ -368,10 +369,17 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
 
             const fat_type: Type = if (cluster_count <= fat.max_clusters.get(.fat12)) .fat12 else if (cluster_count <= fat.max_clusters.get(.fat16)) .fat16 else .fat32;
 
-            return switch (fat_type) {
-                .fat32 => if (config.maximum_supported_type != .fat32) MountError.UnsupportedFat else ctx: {
+            var fat_ctx = switch (fat_type) {
+                .fat32 => ctx: {
+                    if (config.maximum_supported_type != .fat32) {
+                        return MountError.UnsupportedFat;
+                    }
                     if (root_entries != 0) {
                         return MountError.InvalidRootEntries;
+                    }
+
+                    if (!std.mem.eql(u8, "FAT32   ", &ebr32.system_identifier)) {
+                        return MountError.InvalidFilesystemType;
                     }
 
                     if (ebr32.backup_boot_sector != 6) {
@@ -379,6 +387,10 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     }
 
                     const root_entry_cluster = std.mem.readInt(u32, std.mem.asBytes(&ebr32.root_cluster), .little);
+
+                    if (root_entry_cluster < 2) {
+                        return MountError.InvalidRootCluster;
+                    }
 
                     break :ctx Self{
                         .misc = .{
@@ -397,28 +409,69 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         .max_cluster = max_cluster,
                     };
                 },
-                else => |t| if (config.maximum_supported_type == .fat12 and t == .fat16) MountError.UnsupportedFat else Self{
-                    .misc = .{
-                        .type = t,
-                        .mul = fat.mul_shift.get(t),
-                        .div = fat.div_shift.get(t),
-                        .bytes_per_sector = bytes_per_sector_shift,
-                        .sectors_per_cluster = sectors_per_cluster_shift,
-                        .directory_entries_per_sector = directory_entries_per_sector_shift,
-                    },
-                    .root_entry_data = RootDirectoryData{ .sector_info = .{ .sectors = root_entries_sectors } },
-                    .fats = fats,
-                    .fat_size = fat_size,
-                    .reserved_sector_count = reserved_sector_count,
-                    .data_sector_start = data_sector_start,
-                    .max_cluster = max_cluster,
+                else => |t| ctx: {
+                    if (config.maximum_supported_type == .fat12 and t == .fat16) {
+                        return MountError.UnsupportedFat;
+                    }
+
+                    if (!std.mem.eql(u8, "FAT     ", &ebr.system_identifier) and (!std.mem.eql(u8, "FAT12   ", &ebr.system_identifier) and t == .fat12) and (!std.mem.eql(u8, "FAT16   ", &ebr.system_identifier) and t == .fat16)) {
+                        return MountError.InvalidFilesystemType;
+                    }
+
+                    break :ctx Self{
+                        .misc = .{
+                            .type = t,
+                            .mul = fat.mul_shift.get(t),
+                            .div = fat.div_shift.get(t),
+                            .bytes_per_sector = bytes_per_sector_shift,
+                            .sectors_per_cluster = sectors_per_cluster_shift,
+                            .directory_entries_per_sector = directory_entries_per_sector_shift,
+                        },
+                        .root_entry_data = RootDirectoryData{ .sector_info = .{ .sectors = root_entries_sectors } },
+                        .fats = fats,
+                        .fat_size = fat_size,
+                        .reserved_sector_count = reserved_sector_count,
+                        .data_sector_start = data_sector_start,
+                        .max_cluster = max_cluster,
+                    };
                 },
+            };
+
+            if (fat_ctx.getType() != .fat12) {
+                // TODO: Do something about this? Error if had errors or is not clean?
+                // const dirty_flags = try fat_ctx.readDirtyFlags(blk);
+                try fat_ctx.writeDirtyFlags(blk, DirtyVolumeFlags{ .clean = false, .no_error = false });
+            }
+
+            return fat_ctx;
+        }
+
+        pub fn unmount(fat_ctx: *Self, blk: *BlockDevice, no_error: bool) !void {
+            if (fat_ctx.getType() != .fat12) {
+                try fat_ctx.writeDirtyFlags(blk, DirtyVolumeFlags{ .clean = true, .no_error = no_error });
+            }
+        }
+
+        const DirtyVolumeFlags = struct { clean: bool, no_error: bool };
+
+        inline fn readDirtyFlags(fat_ctx: *Self, blk: *BlockDevice) DirtyVolumeFlags {
+            return switch (try fat_ctx.readFatEntry(blk, 0x01)) {
+                .end_of_file => DirtyVolumeFlags{ .clean = true, .no_error = true },
+                .allocated => |v| switch (fat_ctx.getType()) {
+                    .fat16 => DirtyVolumeFlags{ .clean = ((v >> 15) & 0x01) != 0, .no_error = ((v >> 14) & 0x01) != 0 },
+                    .fat32 => DirtyVolumeFlags{ .clean = ((v >> 27) & 0x01) != 0, .no_error = ((v >> 26) & 0x01) != 0 },
+                    else => unreachable,
+                },
+                else => DirtyVolumeFlags{ .clean = false, .no_error = false },
             };
         }
 
-        pub fn unmount(fat_ctx: *Self, blk: *BlockDevice) !void {
-            _ = fat_ctx;
-            _ = blk;
+        fn writeDirtyFlags(fat_ctx: *Self, blk: *BlockDevice, flags: DirtyVolumeFlags) !void {
+            _ = try fat_ctx.writeFatEntry(blk, 0x01, .{ .allocated = switch (fat_ctx.getType()) {
+                .fat16 => (std.math.maxInt(u16) & 0x3FFF) | (@as(u16, @intFromBool(flags.clean)) << 15) | (@as(u16, @intFromBool(flags.no_error)) << 14),
+                .fat32 => (std.math.maxInt(u32) & 0x03FFFFFF) | (@as(u32, @intFromBool(flags.clean)) << 27) | (@as(u32, @intFromBool(flags.no_error)) << 26),
+                else => unreachable,
+            } });
         }
 
         pub inline fn getType(fat_ctx: Self) Type {
