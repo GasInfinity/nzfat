@@ -95,7 +95,7 @@ pub fn main() !void {
     var blk = BasicBlockContext{ .data = data };
 
     // This will make a FAT12 filesystem with some predefined parameters as 1.44MB floppy disks are well known.
-    // But you can try to make a FAT16 filesystem or even FAT32! However it is ddvisen against and an error will be returned if there are not enough clusters.
+    // But you can try to make a FAT16 filesystem or even FAT32! However it is advised against and an error will be returned if there are not enough clusters.
     try nzfat.format.make(&blk, .{
         // The only mandatory config
         .volume_id = [_]u8{ 0x00, 0x00, 0x00, 0x00 },
@@ -105,7 +105,8 @@ pub fn main() !void {
     var fat_ctx = try Fat.mount(&blk);
 
     // Now we have a fat context! (if no error has happened hopefully)
-    // Almost all operations are supported (only moving files/directories without copying is missing)
+    // All operations you'd want are supported! From creating and deleting files/dirs to searching inside a directory and iterating it. Even moving files without copying (That includes renaming files)!
+    // You can write and read to and from files in a very zig-inspired way!
 
     // Any directory entry converted to a file or dir MUST NOT be used after being converted as they won't be updated (Maybe instead store a pointer to the entry instead of copying?)
     // This creates a short directory entry inside '/' (null dir means root), the new entry is a file with an initial size of "Hello World!".len (WARNING: Left uninitialized!)
@@ -121,5 +122,5 @@ pub fn main() !void {
     try fat_ctx.unmount(&blk, true);
 
     // There you have! You just created a FAT12 filesystem and added a file named SHORT.TXT with the contents 'Hello World!'
-    // There are a lot of more API's like `search` to search an entry inside a directory, `directoryEntryIterator` to iterate entries inside a directory or `delete` to delete an entry and free it's allocated data.
+    // As you have seen not a single byte of heap memory has been allocated by the underlying implementation as it only reads and writes from the block device
 }
