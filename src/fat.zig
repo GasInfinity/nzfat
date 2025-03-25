@@ -232,13 +232,17 @@ pub const ExtendedBootRecord32 = extern struct {
 };
 
 pub const FSInfo32 = extern struct {
-    lead_signature: u32 align(1) = 0x41615252,
+    pub const lead_signature_value = 0x41615252;
+    pub const signature_value = 0x61417272;
+    pub const trail_signature_value = 0xAA550000;
+
+    lead_signature: u32 align(1) = lead_signature_value,
     reserved1: [480]u8 align(1) = std.mem.zeroes([480]u8),
-    signature: u32 align(1) = 0x61417272,
+    signature: u32 align(1) = signature_value,
     last_known_free_cluster_count: u32 align(1),
     last_known_available_cluster: u32 align(1),
     reserved2: [12]u8 align(1) = std.mem.zeroes([12]u8),
-    trail_signature: u32 align(1) = 0xAA550000,
+    trail_signature: u32 align(1) = trail_signature_value,
 };
 
 pub const Attributes = packed struct(u8) {

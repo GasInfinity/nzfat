@@ -1,24 +1,9 @@
-const std = @import("std");
-
-pub const fat = @import("fat.zig");
 pub const format = @import("format.zig");
 
-const BiosParameterBlock = fat.BiosParameterBlock;
-const ExtendedBootRecord = fat.ExtendedBootRecord;
-const ExtendedBootRecord32 = fat.ExtendedBootRecord32;
-const FSInfo32 = fat.FSInfo32;
-const DiskAttributes = fat.Attributes;
-const DiskDirectoryEntry = fat.DirectoryEntry;
-const LongFileNameEntry = fat.LongFileNameEntry;
-
+pub const Type = fat.Type;
 pub const Time = fat.Time;
 pub const Date = fat.Date;
-pub const Type = fat.Type;
 pub const ShortFilenameDisplay = fat.sfn.Display;
-
-// TODO: Maybe reorganize this
-
-const log = std.log.scoped(.nzfat);
 
 pub const MountError = error{
     /// Invalid jump code, it must be 0xEB or 0xE9
@@ -45,11 +30,12 @@ pub const MountError = error{
     InvalidBackupSector,
     /// Invalid Filesystem type inside the EBR32 or EBR.
     InvalidFilesystemType,
+    /// Invalid FSInfo sector in the EBR32. It must be 0 or 1.
+    InvalidFSInfo,
     /// Trying to mount an unsupported higher bit count FAT filesystem.
     UnsupportedFat,
 };
 
-// TODO: Think even more about this
 pub const AsciiOnlyLongContext = struct {
     pub fn utf16LeToCodepage(_: AsciiOnlyLongContext, filename: *ShortFilenameDisplay, utf16: []const u16) bool {
         const last_possible_dot = std.mem.lastIndexOf(u16, utf16, std.unicode.utf8ToUtf16LeStringLiteral("."));
@@ -160,7 +146,7 @@ pub const CreationType = union(EntryType) {
     file: u32,
 
     /// Create a new directory and allocate at least N clusters to be able to hold at least the specified pre-allocated entries.
-    directory: usize,
+    directory: u16,
 };
 
 pub const CreationInfo = struct {
@@ -288,6 +274,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
         fat_size: FatSize,
         data_sector_start: u32,
         max_cluster: Cluster,
+        last_known_available_cluster: Cluster,
+        last_known_free_clusters: Cluster,
 
         pub fn mount(blk: *BlockDevice) !Self {
             const first_sector: BlockSectorResult = try blk.map(0);
@@ -392,6 +380,25 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         return MountError.InvalidRootCluster;
                     }
 
+                    const fsinfo_sector_index = std.mem.readInt(u16, std.mem.asBytes(&ebr32.fsinfo_sector), .little);
+
+                    if (fsinfo_sector_index != 0 and fsinfo_sector_index != 1) {
+                        return MountError.InvalidFSInfo;
+                    }
+                    const last_known_available_cluster: Cluster, const last_known_free_clusters: Cluster = if (fsinfo_sector_index == 0)
+                        .{ 0xFFFFFFFF, 0xFFFFFFFF }
+                    else fsinfo: {
+                        const fsinfo_sector = try blk.map(fsinfo_sector_index);
+                        defer blk.unmap(fsinfo_sector_index, fsinfo_sector);
+                        const fsinfo: *const FSInfo32 = std.mem.bytesAsValue(FSInfo32, fsinfo_sector.asSlice());
+
+                        if (fsinfo.lead_signature != FSInfo32.lead_signature_value or fsinfo.signature != FSInfo32.signature_value or fsinfo.trail_signature != FSInfo32.trail_signature_value) {
+                            return MountError.InvalidFSInfo;
+                        }
+
+                        break :fsinfo .{ fsinfo.last_known_available_cluster, fsinfo.last_known_free_cluster_count };
+                    };
+
                     break :ctx Self{
                         .misc = .{
                             .type = .fat32,
@@ -407,6 +414,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         .reserved_sector_count = reserved_sector_count,
                         .data_sector_start = data_sector_start,
                         .max_cluster = max_cluster,
+                        .last_known_available_cluster = last_known_available_cluster,
+                        .last_known_free_clusters = last_known_free_clusters,
                     };
                 },
                 else => |t| ctx: {
@@ -433,6 +442,8 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                         .reserved_sector_count = reserved_sector_count,
                         .data_sector_start = data_sector_start,
                         .max_cluster = max_cluster,
+                        .last_known_available_cluster = 2,
+                        .last_known_free_clusters = std.math.maxInt(Cluster),
                     };
                 },
             };
@@ -1295,7 +1306,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             var entry_location: DirectoryEntrySectorLocation = std.mem.zeroes(DirectoryEntrySectorLocation);
 
             var iterated_entries: u16 = 0;
-            var sequential_entries: usize = 0;
+            var sequential_entries: u32 = 0;
 
             var dir_it = fat_ctx.diskDirectoryEntryIterator(directory_cluster);
             defer dir_it.deinit(blk);
@@ -1346,7 +1357,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                     return EntryCreationError.OutOfRootDirectoryEntries;
                 }
 
-                const needed_clusters = (((needed_entries - sequential_entries) + directory_entries_per_sector) >> fat_ctx.misc.directory_entries_per_sector) >> fat_ctx.misc.sectors_per_cluster;
+                const needed_clusters: u32 = (((needed_entries - sequential_entries) + directory_entries_per_sector) >> fat_ctx.misc.directory_entries_per_sector) >> fat_ctx.misc.sectors_per_cluster;
                 const newly_allocated_cluster = try fat_ctx.allocateDirectoryClusters(blk, needed_clusters);
                 _ = try fat_ctx.writeFatEntry(blk, last_cluster, .{ .allocated = newly_allocated_cluster });
             }
@@ -1358,7 +1369,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 .new => |new_entry_info| {
                     const allocated_cluster, const file_size = switch (new_entry_info.type) {
                         .directory => |entries| v: {
-                            const directory_entries_per_sector = @as(usize, 1) << fat_ctx.misc.directory_entries_per_sector;
+                            const directory_entries_per_sector = @as(u16, 1) << fat_ctx.misc.directory_entries_per_sector;
                             const directory_entries_per_cluster = directory_entries_per_sector << fat_ctx.misc.sectors_per_cluster;
 
                             // NOTE: We add 2 as we must add the '.' and '..' entries.
@@ -1369,7 +1380,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                             break :v .{ first_allocated, 0 };
                         },
                         .file => |size| v: {
-                            const bytes_per_sector = @as(usize, 1) << fat_ctx.misc.bytes_per_sector;
+                            const bytes_per_sector = @as(u32, 1) << fat_ctx.misc.bytes_per_sector;
                             const bytes_per_cluster = bytes_per_sector << fat_ctx.misc.sectors_per_cluster;
 
                             const needed_clusters = ((size + bytes_per_cluster - 1) >> fat_ctx.misc.bytes_per_sector) >> fat_ctx.misc.sectors_per_cluster;
@@ -1407,7 +1418,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             try blk.commit(sector_index, sector);
         }
 
-        fn allocateDirectoryClusters(fat_ctx: *Self, blk: *BlockDevice, n: usize) !Cluster {
+        fn allocateDirectoryClusters(fat_ctx: *Self, blk: *BlockDevice, n: u32) !Cluster {
             const first_allocated = try fat_ctx.allocateClusters(blk, n);
 
             const sectors_per_cluster = (@as(u8, 1) << fat_ctx.misc.sectors_per_cluster);
@@ -1448,8 +1459,10 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             return first_allocated;
         }
 
-        fn allocateClusters(fat_ctx: *Self, blk: *BlockDevice, n: usize) BlockMapOrCommitOrClusterTraversalError!Cluster {
+        fn allocateClusters(fat_ctx: *Self, blk: *BlockDevice, n: u32) BlockMapOrCommitOrClusterTraversalError!Cluster {
             std.debug.assert(n > 0);
+
+            const last_available_cluster = fat_ctx.last_known_available_cluster;
 
             const first_next = try fat_ctx.searchFreeCluster(blk);
             _ = try fat_ctx.writeFatEntry(blk, first_next, .end_of_file);
@@ -1460,6 +1473,7 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
                 // TODO: Wraparound when searching
                 const next_free = fat_ctx.linearSearchFreeCluster(blk, current_cluster + 1) catch |e| switch (e) {
                     ClusterAllocationError.NoSpaceLeft => {
+                        fat_ctx.last_known_available_cluster = last_available_cluster;
                         try fat_ctx.deleteClusterChain(blk, first_next);
                         return e;
                     },
@@ -1471,6 +1485,11 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             }
 
             _ = try fat_ctx.writeFatEntry(blk, current_cluster, .end_of_file);
+
+            if (fat_ctx.last_known_free_clusters != std.math.maxInt(Cluster)) {
+                fat_ctx.last_known_free_clusters -|= n;
+            }
+
             return first_next;
         }
 
@@ -1746,19 +1765,31 @@ pub fn FatFilesystem(comptime BlockDevice: type, comptime config: Config) type {
             return @as(BlockSector, fat_ctx.data_sector_start) + (@as(BlockSector, (cluster -| 2)) << fat_ctx.misc.sectors_per_cluster);
         }
 
-        // TODO: Cache last free cluster and deleted clusters in FAT32
         inline fn searchFreeCluster(fat_ctx: *Self, blk: *BlockDevice) BlockMapOrClusterAllocationError!Cluster {
-            return fat_ctx.linearSearchFreeCluster(blk, 2);
+            const start = if (fat_ctx.last_known_available_cluster == std.math.maxInt(Cluster))
+                2
+            else
+                fat_ctx.last_known_available_cluster;
+
+            return fat_ctx.linearSearchFreeCluster(blk, start);
         }
 
         fn linearSearchFreeCluster(fat_ctx: *Self, blk: *BlockDevice, start: Cluster) BlockMapOrClusterAllocationError!Cluster {
             var currentCluster: Cluster = start;
-            return e: while (currentCluster <= fat_ctx.max_cluster) : (currentCluster += 1) {
+            return e: while (currentCluster <= fat_ctx.max_cluster) : (currentCluster = fat_ctx.incrementCluster(currentCluster)) {
                 switch (try fat_ctx.readFatEntry(blk, currentCluster)) {
-                    .free => break :e currentCluster,
+                    .free => {
+                        fat_ctx.last_known_available_cluster = fat_ctx.incrementCluster(currentCluster);
+                        break :e currentCluster;
+                    },
                     else => {},
                 }
             } else ClusterAllocationError.NoSpaceLeft;
+        }
+
+        inline fn incrementCluster(fat_ctx: Self, cluster: Cluster) Cluster {
+            const new = cluster + 1;
+            return if (cluster == fat_ctx.max_cluster) 2 else new;
         }
 
         inline fn readNextAllocatedCluster(fat_ctx: *Self, blk: *BlockDevice, cluster_index: Cluster) BlockMapOrClusterTraversalError!?Cluster {
@@ -1923,3 +1954,16 @@ test {
     _ = fat;
     _ = format;
 }
+
+const std = @import("std");
+const fat = @import("fat.zig");
+
+const BiosParameterBlock = fat.BiosParameterBlock;
+const ExtendedBootRecord = fat.ExtendedBootRecord;
+const ExtendedBootRecord32 = fat.ExtendedBootRecord32;
+const FSInfo32 = fat.FSInfo32;
+const DiskAttributes = fat.Attributes;
+const DiskDirectoryEntry = fat.DirectoryEntry;
+const LongFileNameEntry = fat.LongFileNameEntry;
+
+const log = std.log.scoped(.nzfat);
