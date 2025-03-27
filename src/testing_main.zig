@@ -93,10 +93,9 @@ pub fn main() !void {
     }
 
     const floppy_file = try std.fs.cwd().openFile(args[1], .{ .mode = .read_write });
-    try floppy_file.setEndPos(2880 * 512);
 
     var floppy_blk_ctx = FileBlockContext{ .allocator = alloc, .fd = floppy_file, .logical_block_size = 512 };
-    // _ = try nzfat.format.make(&floppy_blk_ctx, .{ .volume_id = std.mem.zeroes([4]u8) });
+    // _ = try nzfat.format.make(&floppy_blk_ctx, .{ .fat_type = .fat32, .volume_id = std.mem.zeroes([4]u8) });
 
     var fat_ctx = Fat.mount(&floppy_blk_ctx) catch |err| switch (err) {
         nzfat.MountError.InvalidBackupSector, nzfat.MountError.InvalidBootSignature, nzfat.MountError.InvalidBytesPerSector, nzfat.MountError.InvalidFatSize, nzfat.MountError.InvalidJump, nzfat.MountError.InvalidMediaType, nzfat.MountError.InvalidReservedSectorCount, nzfat.MountError.InvalidRootEntries, nzfat.MountError.InvalidSectorCount, nzfat.MountError.InvalidSectorsPerCluster, nzfat.MountError.UnsupportedFat => {

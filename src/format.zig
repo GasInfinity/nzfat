@@ -1,14 +1,3 @@
-const std = @import("std");
-const fat = @import("fat.zig");
-
-const BiosParameterBlock = fat.BiosParameterBlock;
-const ExtendedBootRecord = fat.ExtendedBootRecord;
-const ExtendedBootRecord32 = fat.ExtendedBootRecord32;
-const FSInfo32 = fat.FSInfo32;
-const DiskDirectoryEntry = fat.DirectoryEntry;
-
-const log = std.log.scoped(.nzfat_format);
-
 const bootsector_origin = 0x7C00;
 
 const default_boot_code = @embedFile("assets/unbootable.bin");
@@ -96,7 +85,31 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
     // Zeroing all FAT'S
     for (0..fat_parameters.fats) |current_fat| {
         const current_fat_start = fat_start + current_fat * fat_parameters.fat_size;
-        for (0..fat_parameters.fat_size) |current_sector| {
+        const first_fat_sector = try blk.map(current_fat_start);
+        defer blk.unmap(current_fat_start, first_fat_sector);
+        @memset(first_fat_sector.asSlice(), 0x00);
+        const first_fat_sector_data = first_fat_sector.asSlice();
+
+        switch (fat_parameters.fat_type) {
+            .fat12 => {
+                first_fat_sector_data[0] = fat_parameters.media_type;
+                first_fat_sector_data[1] = 0x0F;
+            },
+            .fat16 => {
+                std.mem.writeInt(u16, first_fat_sector_data[0..2], @as(u16, 0xFF00) | fat_parameters.media_type, .little);
+                std.mem.writeInt(u16, first_fat_sector_data[2..4], 0xFFFF, .little);
+            },
+            .fat32 => {
+                std.mem.writeInt(u32, first_fat_sector_data[0..4], @as(u32, 0x0FFFFF00) | fat_parameters.media_type, .little);
+                std.mem.writeInt(u32, first_fat_sector_data[4..8], 0x0FFFFFFF, .little);
+
+                // NOTE: This sets the root directory entry to EOF because it is hardcoded to be cluster 2 (a.k.a: the start of data)
+                std.mem.writeInt(u32, first_fat_sector_data[8..12], 0x0FFFFFFF, .little);
+            },
+        }
+
+        try blk.commit(current_fat_start, first_fat_sector);
+        for (1..fat_parameters.fat_size) |current_sector| {
             const fat_sector_index = current_fat_start + current_sector;
             const fat_sector = try blk.map(fat_sector_index);
             defer blk.unmap(fat_sector_index, fat_sector);
@@ -146,7 +159,7 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
         const fsinfo_slice = fsinfo_sector.asSlice();
         const fsinfo32: *align(1) FSInfo32 = std.mem.bytesAsValue(FSInfo32, fsinfo_slice);
 
-        const data_offset = fat_parameters.reserved_sectors - fat_parameters.fat_size * fat_parameters.fats;
+        const data_offset = fat_parameters.reserved_sectors + fat_parameters.fat_size * fat_parameters.fats;
         const cluster_count = (fat_blk_size - data_offset) / fat_parameters.sectors_per_cluster;
 
         fsinfo32.* = FSInfo32{
@@ -155,7 +168,21 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
         };
 
         try blk.commit(1, fsinfo_sector);
-        // TODO: Copy the boot record, fsinfo and first reserved sector into the backup sectors!
+
+        {
+            // NOTE: The user is responsible for adding data and backing up their first reserved sector. We only back up what we use and have.
+            const bpb_backup_sector_index = 6;
+            const bpb_backup_sector = try blk.map(bpb_backup_sector_index);
+            defer blk.unmap(bpb_backup_sector_index, bpb_backup_sector);
+            @memcpy(bpb_backup_sector.asSlice(), boot_sector.asSlice());
+            try blk.commit(bpb_backup_sector_index, bpb_backup_sector);
+
+            const fsinfo_backup_sector_index = bpb_backup_sector_index + 1;
+            const fsinfo_backup_sector = try blk.map(fsinfo_backup_sector_index);
+            defer blk.unmap(fsinfo_backup_sector_index, fsinfo_backup_sector);
+            @memcpy(fsinfo_backup_sector.asSlice(), fsinfo_sector.asSlice());
+            try blk.commit(fsinfo_backup_sector_index, fsinfo_backup_sector);
+        }
 
         const directory_entries_per_sector = bytes_per_sector / @sizeOf(fat.DirectoryEntry);
 
@@ -202,7 +229,7 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
         }
 
         const root_entries_sectors = ((fat_parameters.root_directory_entries * @sizeOf(DiskDirectoryEntry)) + (bytes_per_sector - 1)) / bytes_per_sector;
-        const root_entries_start = fat_parameters.reserved_sectors + (fat_parameters.fats * fat_parameters.fat_size);
+        const root_entries_start = fat_start + (fat_parameters.fats * fat_parameters.fat_size);
 
         // Zero out all possible root entries
         for (0..root_entries_sectors) |current_root_sector| {
@@ -216,8 +243,6 @@ pub fn make(blk: anytype, config: Config) !FatParameters {
     }
 
     try blk.commit(0, boot_sector);
-
-    // TODO: Write the 0th and 1st FAT entries to leave the disk in a "clean" state
     return fat_parameters;
 }
 
@@ -514,18 +539,15 @@ const fat32_size_parameters = [_]SizeToSectorsPerCluster{
 pub fn supportsSectorsPerCluster(fat_type: Type, fats: u8, sectors: u32, bytes_per_sector_shift: u5, sectors_per_cluster_shift: u3) ?u32 {
     std.debug.assert(bytes_per_sector_shift >= fat.min_bytes_per_sector_shift);
 
-    const bytes_per_sector = (@as(u32, 1) << bytes_per_sector_shift);
     const sectors_per_cluster = (@as(u32, 1) << sectors_per_cluster_shift);
 
     const min_clusters = fat.min_clusters.get(fat_type);
     const max_clusters = fat.max_clusters.get(fat_type);
 
     const total_clusters = (sectors >> sectors_per_cluster_shift);
-    // NOTE: This multiplication is safe as bytes_per_sector_shift will always be >= 9
-    const maximum_fats_clusters = (fats * ((max_clusters + (bytes_per_sector << sectors_per_cluster_shift) - 1) >> (bytes_per_sector_shift + sectors_per_cluster_shift))) - 1;
 
-    // Too small or Too big, then discard
-    if (total_clusters < maximum_fats_clusters or (total_clusters - maximum_fats_clusters) > max_clusters) {
+    // First initial check, truly too small or too big, discard.
+    if (total_clusters < min_clusters or total_clusters > max_clusters) {
         return null;
     }
 
@@ -544,3 +566,14 @@ pub fn supportsSectorsPerCluster(fat_type: Type, fats: u8, sectors: u32, bytes_p
 const testing = std.testing;
 
 test {}
+
+const std = @import("std");
+const fat = @import("fat.zig");
+
+const BiosParameterBlock = fat.BiosParameterBlock;
+const ExtendedBootRecord = fat.ExtendedBootRecord;
+const ExtendedBootRecord32 = fat.ExtendedBootRecord32;
+const FSInfo32 = fat.FSInfo32;
+const DiskDirectoryEntry = fat.DirectoryEntry;
+
+const log = std.log.scoped(.nzfat_format);

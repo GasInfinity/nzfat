@@ -32,9 +32,9 @@ Please see [a basic example](examples/basic.zig) or [messy testing code that use
 - [x] API for moving files without copying
 - [x] Utility to write files given a buffer (a.k.a: writeAllBytes)
 - [x] Proper FAT unmounting
+- [x] Finish FAT32 formatting
 - [ ] Proper FAT mirroring and active FAT handling
-- [ ] Proper FAT32 FSInfo handling
-- [ ] Finish FAT32 formatting
+- [ ] Optimize the filesystem by properly using FSInfo32 or caching the last free sector/free sector count (When do we calculate it in FAT12/16/(32 when there's no fsinfo or an invalid one)?)
 - [ ] Utility to check and 'fix' fat filesystem
 - [ ] Comptime utility function to create directories and files given a comptime known path (Really useful!)
 - [ ] Comptime utility function to search for directories and files given a comptime known path (Really useful!)
